@@ -1,0 +1,14 @@
+name: Build Unsigned Developer Artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned packages
+    uses: ./.github/workflows/build.yml
+    with:
+      release_mode: false

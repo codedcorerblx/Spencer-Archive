@@ -1,0 +1,35 @@
+#pragma once
+#include <cstdint>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
+
+
+// --- File Resolution ---
+std::string ResolveSettingsFilePath();
+std::recursive_mutex& GetProfilePersistenceMutex();
+
+// --- Core Settings Logic ---
+bool SaveSettings(const std::string& filepath, const std::string& profile_name);
+bool LoadSettings(std::string filepath, std::string profile_name);
+bool TryLoadLastActiveProfile(std::string filepath);
+bool SaveDefaultProfile(const std::string& filepath);
+void CaptureDefaultProfileSnapshot();
+std::string PromoteDefaultProfileIfDirty(const std::string& filepath);
+void SyncRuntimeSettingsFromBuffers();
+
+using SavedSettingValue = std::variant<bool, std::int64_t, double, std::string>;
+std::optional<SavedSettingValue> TryGetSavedSettingValue(const std::string& name);
+
+// --- Profile Manipulation ---
+std::vector<std::string> GetProfileNames(const std::string& filepath);
+bool DeleteProfileFromFile(const std::string& filepath, const std::string& profile_name);
+bool RenameProfileInFile(const std::string& filepath, const std::string& old_name, const std::string& new_name);
+bool DuplicateProfileInFile(const std::string& filepath, const std::string& source_name, const std::string& new_name);
+
+// --- ImGui UI ---
+namespace ProfileUI {
+    void DrawProfileManagerUI();
+}

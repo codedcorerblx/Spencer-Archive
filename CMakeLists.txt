@@ -1,0 +1,849 @@
+cmake_minimum_required(VERSION 3.23)
+
+cmake_policy(SET CMP0091 NEW)
+
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/version" SMU_VERSION)
+string(STRIP "${SMU_VERSION}" SMU_VERSION)
+if(NOT SMU_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "The version file must contain one semantic version such as 3.3.0.")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/version")
+
+project(SpencerMacroUtilities VERSION "${SMU_VERSION}" LANGUAGES C CXX)
+
+include(CTest)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+set(SMU_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${SMU_GENERATED_DIR}")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/smu_version.h.in"
+    "${SMU_GENERATED_DIR}/smu_version.h"
+    @ONLY
+)
+include_directories("${SMU_GENERATED_DIR}")
+
+set(SMU_APP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/app")
+set(SMU_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/core")
+set(SMU_PLATFORM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/platform")
+set(SMU_PLATFORM_WINDOWS_DIR "${SMU_PLATFORM_DIR}/windows")
+set(SMU_PLATFORM_LINUX_DIR "${SMU_PLATFORM_DIR}/linux")
+set(SMU_PLATFORM_MACOS_DIR "${SMU_PLATFORM_DIR}/macos")
+set(SMU_UPDATER_DIR "${SMU_PLATFORM_DIR}/updater")
+set(SMU_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+set(SMU_MACRO_TUTORIAL_ASSETS_DIR "${SMU_ASSETS_DIR}/macro_tutorials")
+set(SMU_RESOURCES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/resources")
+set(SMU_WINDOWS_RESOURCES_DIR "${SMU_RESOURCES_DIR}/windows")
+set(SMU_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+set(SMU_IMGUI_DIR "${SMU_THIRD_PARTY_DIR}/imgui")
+set(SMU_MINIZ_DIR "${SMU_THIRD_PARTY_DIR}/miniz")
+set(SMU_WINDIVERT_DIR "${SMU_THIRD_PARTY_DIR}/windivert")
+set(SMU_JSON_DIR "${SMU_THIRD_PARTY_DIR}/json")
+set(SMU_LUA_DIR "${SMU_THIRD_PARTY_DIR}/lua")
+set(SMU_IMGUIFILEDIALOG_DIR "${SMU_THIRD_PARTY_DIR}/ImGuiFileDialog")
+set(SMU_WINDOWS_SDL3_DIR "${SMU_THIRD_PARTY_DIR}/SDL3-windows")
+set(SMU_LICENSE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(SMU_PRIVACY_FILE "${CMAKE_CURRENT_SOURCE_DIR}/PRIVACY.md")
+set(SMU_THIRD_PARTY_NOTICES_FILE "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md")
+set(SMU_SDL_LICENSE_FILE "${SMU_THIRD_PARTY_DIR}/SDL/LICENSE.txt")
+set(SMU_APPIMAGE_RUNTIME_LICENSE_FILE "${SMU_THIRD_PARTY_DIR}/appimage-runtime/LICENSE")
+set(SMU_GO_IPTABLES_LICENSE_FILE "${SMU_PLATFORM_LINUX_DIR}/nethelper/vendor/github.com/coreos/go-iptables/LICENSE")
+set(SMU_GO_IPTABLES_NOTICE_FILE "${SMU_PLATFORM_LINUX_DIR}/nethelper/vendor/github.com/coreos/go-iptables/NOTICE")
+set(SMU_WINDIVERT_LICENSE_FILE "${SMU_WINDIVERT_DIR}/LICENSE-LGPL-3.0.txt")
+
+option(SMU_BUNDLE_SDL3 "Bundle SDL3 shared libraries into the Linux portable output folder." ON)
+option(SMU_LINK_SDL3_STATIC "Link the Linux build against vendored SDL3 static library when available." OFF)
+option(SMU_ENABLE_SOURCE_TREE_FALLBACK "Allow development builds to locate assets in this source checkout." ON)
+option(SMU_REQUIRE_WAYLAND_SCREENCAST "Fail Linux configuration when PipeWire ScreenCast support is unavailable." OFF)
+option(SMU_BUILD_SLEEP_BENCHMARK "Build the optional Lua precise-sleep benchmark." OFF)
+
+add_library(lua_static STATIC
+    "${SMU_LUA_DIR}/src/lapi.c"
+    "${SMU_LUA_DIR}/src/lauxlib.c"
+    "${SMU_LUA_DIR}/src/lbaselib.c"
+    "${SMU_LUA_DIR}/src/lcode.c"
+    "${SMU_LUA_DIR}/src/lcorolib.c"
+    "${SMU_LUA_DIR}/src/lctype.c"
+    "${SMU_LUA_DIR}/src/ldblib.c"
+    "${SMU_LUA_DIR}/src/ldebug.c"
+    "${SMU_LUA_DIR}/src/ldo.c"
+    "${SMU_LUA_DIR}/src/ldump.c"
+    "${SMU_LUA_DIR}/src/lfunc.c"
+    "${SMU_LUA_DIR}/src/lgc.c"
+    "${SMU_LUA_DIR}/src/linit.c"
+    "${SMU_LUA_DIR}/src/liolib.c"
+    "${SMU_LUA_DIR}/src/llex.c"
+    "${SMU_LUA_DIR}/src/lmathlib.c"
+    "${SMU_LUA_DIR}/src/lmem.c"
+    "${SMU_LUA_DIR}/src/loadlib.c"
+    "${SMU_LUA_DIR}/src/lobject.c"
+    "${SMU_LUA_DIR}/src/lopcodes.c"
+    "${SMU_LUA_DIR}/src/loslib.c"
+    "${SMU_LUA_DIR}/src/lparser.c"
+    "${SMU_LUA_DIR}/src/lstate.c"
+    "${SMU_LUA_DIR}/src/lstring.c"
+    "${SMU_LUA_DIR}/src/lstrlib.c"
+    "${SMU_LUA_DIR}/src/ltable.c"
+    "${SMU_LUA_DIR}/src/ltablib.c"
+    "${SMU_LUA_DIR}/src/ltm.c"
+    "${SMU_LUA_DIR}/src/lundump.c"
+    "${SMU_LUA_DIR}/src/lutf8lib.c"
+    "${SMU_LUA_DIR}/src/lvm.c"
+    "${SMU_LUA_DIR}/src/lzio.c"
+)
+
+target_include_directories(lua_static PUBLIC "${SMU_LUA_DIR}/include")
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(lua_static PUBLIC m ${CMAKE_DL_LIBS})
+endif()
+
+set_property(TARGET lua_static PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
+if(BUILD_TESTING AND SMU_BUILD_SLEEP_BENCHMARK)
+    find_package(Threads REQUIRED)
+    add_executable(smu_precise_sleep_benchmark
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/precise_sleep_benchmark.cpp"
+    )
+    target_include_directories(smu_precise_sleep_benchmark PRIVATE
+        "${SMU_LUA_DIR}/include"
+    )
+    target_link_libraries(smu_precise_sleep_benchmark PRIVATE
+        lua_static
+        Threads::Threads
+    )
+endif()
+
+if(BUILD_TESTING)
+    add_executable(smu_roblox_log_reader_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/roblox_log_reader_test.cpp"
+        "${SMU_PLATFORM_DIR}/roblox_log_reader.cpp"
+    )
+    target_include_directories(smu_roblox_log_reader_test PRIVATE
+        "${SMU_PLATFORM_DIR}"
+    )
+    add_test(NAME roblox-log-reader COMMAND smu_roblox_log_reader_test)
+endif()
+
+if(WIN32)
+    enable_language(RC)
+
+    set(SMU_WINDOWS_SOURCES
+        "${SMU_IMGUI_DIR}/imgui.cpp"
+        "${SMU_IMGUI_DIR}/imgui_demo.cpp"
+        "${SMU_IMGUI_DIR}/imgui_draw.cpp"
+        "${SMU_IMGUI_DIR}/imgui_impl_opengl3.cpp"
+        "${SMU_IMGUI_DIR}/imgui_impl_sdl3.cpp"
+        "${SMU_IMGUI_DIR}/imgui_tables.cpp"
+        "${SMU_IMGUI_DIR}/imgui_widgets.cpp"
+        "${SMU_APP_DIR}/app_assets.cpp"
+        "${SMU_APP_DIR}/app_context.cpp"
+        "${SMU_APP_DIR}/app_main.cpp"
+        "${SMU_APP_DIR}/app_profile_bridge.cpp"
+        "${SMU_APP_DIR}/app_theme_bridge.cpp"
+        "${SMU_APP_DIR}/app_ui.cpp"
+        "${SMU_APP_DIR}/askpass.cpp"
+        "${SMU_APP_DIR}/input_actions.cpp"
+        "${SMU_APP_DIR}/macro_runtime.cpp"
+        "${SMU_APP_DIR}/macro_tutorial_assets.cpp"
+        "${SMU_APP_DIR}/main_windows.cpp"
+        "${SMU_APP_DIR}/profile_manager.cpp"
+        "${SMU_APP_DIR}/script_api.cpp"
+        "${SMU_APP_DIR}/script_instance.cpp"
+        "${SMU_APP_DIR}/script_manager.cpp"
+        "${SMU_APP_DIR}/script_metadata.cpp"
+        "${SMU_APP_DIR}/theme_manager.cpp"
+        "${SMU_CORE_DIR}/app_state.cpp"
+        "${SMU_CORE_DIR}/macro_state.cpp"
+        "${SMU_PLATFORM_DIR}/file_dialog.cpp"
+        "${SMU_PLATFORM_DIR}/input_backend.cpp"
+        "${SMU_PLATFORM_DIR}/logging.cpp"
+        "${SMU_PLATFORM_DIR}/network_backend.cpp"
+        "${SMU_PLATFORM_DIR}/platform_capabilities.cpp"
+        "${SMU_PLATFORM_DIR}/process_backend.cpp"
+        "${SMU_PLATFORM_DIR}/roblox_log_reader.cpp"
+        "${SMU_PLATFORM_DIR}/text_input_backend.cpp"
+        "${SMU_PLATFORM_DIR}/window_backend.cpp"
+        "${SMU_UPDATER_DIR}/updater.cpp"
+        "${SMU_UPDATER_DIR}/windows_updater.cpp"
+        "${SMU_PLATFORM_WINDOWS_DIR}/input_sendinput.cpp"
+        "${SMU_PLATFORM_WINDOWS_DIR}/admin_elevation.cpp"
+        "${SMU_PLATFORM_WINDOWS_DIR}/file_dialog_win32.cpp"
+        "${SMU_PLATFORM_WINDOWS_DIR}/lagswitch_overlay.cpp"
+        "${SMU_PLATFORM_WINDOWS_DIR}/network_windivert.cpp"
+        "${SMU_PLATFORM_WINDOWS_DIR}/process_win32.cpp"
+        "${SMU_PLATFORM_WINDOWS_DIR}/windows_backends.cpp"
+        "${SMU_IMGUIFILEDIALOG_DIR}/ImGuiFileDialog.cpp"
+        "${SMU_MINIZ_DIR}/miniz.c"
+        "${SMU_WINDOWS_RESOURCES_DIR}/suspend.rc"
+    )
+
+    add_executable(suspend WIN32 ${SMU_WINDOWS_SOURCES})
+
+    target_include_directories(suspend PRIVATE
+        "${SMU_APP_DIR}"
+        "${SMU_CORE_DIR}"
+        "${SMU_PLATFORM_DIR}"
+        "${SMU_PLATFORM_WINDOWS_DIR}"
+        "${SMU_IMGUI_DIR}"
+        "${SMU_IMGUIFILEDIALOG_DIR}"
+        "${SMU_MINIZ_DIR}"
+        "${SMU_WINDIVERT_DIR}"
+        "${SMU_JSON_DIR}"
+        "${SMU_WINDOWS_RESOURCES_DIR}"
+        "${SMU_WINDOWS_SDL3_DIR}/include"
+        "${SMU_GENERATED_DIR}"
+    )
+
+    target_compile_definitions(suspend PRIVATE
+        UNICODE
+        _UNICODE
+        _CONSOLE
+        "$<$<CONFIG:Debug>:_DEBUG>"
+        "$<$<NOT:$<CONFIG:Debug>>:NDEBUG>"
+        SMU_USE_PLATFORM_ENTRYPOINT=1
+    )
+
+    set_property(TARGET suspend PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+
+    if(MSVC)
+        target_compile_options(suspend PRIVATE
+            /W3
+            /permissive-
+            /Zc:__cplusplus
+            "$<$<CONFIG:Release>:/GS->"
+            "$<$<CONFIG:Release>:/Gw>"
+        )
+
+        target_link_options(suspend PRIVATE
+            /SUBSYSTEM:WINDOWS
+            "$<$<CONFIG:Debug>:/DEBUG>"
+            "$<$<CONFIG:Release>:/OPT:REF>"
+            "$<$<CONFIG:Release>:/OPT:ICF>"
+        )
+    endif()
+
+    set(SMU_SDL3_STATIC_LIB "${SMU_WINDOWS_SDL3_DIR}/lib/SDL3-static.lib")
+    if(EXISTS "${SMU_SDL3_STATIC_LIB}")
+        target_link_libraries(suspend PRIVATE "${SMU_SDL3_STATIC_LIB}")
+    else()
+        message(WARNING "SDL3 static library was not found: ${SMU_SDL3_STATIC_LIB}")
+    endif()
+
+    target_link_libraries(suspend PRIVATE
+        lua_static
+        opengl32
+        user32
+        comdlg32
+        gdi32
+        shell32
+        ole32
+        oleaut32
+        uuid
+        advapi32
+        winmm
+        version
+        setupapi
+        cfgmgr32
+        iphlpapi
+        imm32
+        shlwapi
+        wininet
+        wintrust
+        crypt32
+        Shcore
+        dwmapi
+        xinput
+    )
+
+    # Windows runtime assets are embedded into resources/windows/suspend.rc.
+    # Do not copy an assets folder next to suspend.exe.
+    add_custom_command(TARGET suspend POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:suspend>/licenses"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_LICENSE_FILE}" "$<TARGET_FILE_DIR:suspend>/LICENSE"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_PRIVACY_FILE}" "$<TARGET_FILE_DIR:suspend>/PRIVACY.md"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_THIRD_PARTY_NOTICES_FILE}" "$<TARGET_FILE_DIR:suspend>/THIRD_PARTY_NOTICES.md"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_SDL_LICENSE_FILE}" "$<TARGET_FILE_DIR:suspend>/licenses/SDL.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_APPIMAGE_RUNTIME_LICENSE_FILE}" "$<TARGET_FILE_DIR:suspend>/licenses/AppImage-type2-runtime.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_GO_IPTABLES_LICENSE_FILE}" "$<TARGET_FILE_DIR:suspend>/licenses/go-iptables-LICENSE.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_GO_IPTABLES_NOTICE_FILE}" "$<TARGET_FILE_DIR:suspend>/licenses/go-iptables-NOTICE.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_WINDIVERT_LICENSE_FILE}" "$<TARGET_FILE_DIR:suspend>/licenses/WinDivert-LGPL-3.0.txt"
+        COMMENT "Copying license notices next to suspend.exe"
+    )
+elseif(UNIX AND NOT APPLE)
+    find_package(OpenGL REQUIRED)
+    find_package(Threads REQUIRED)
+    find_package(X11 QUIET)
+    find_package(PkgConfig QUIET)
+
+    if(PkgConfig_FOUND)
+        pkg_check_modules(PIPEWIRE QUIET IMPORTED_TARGET libpipewire-0.3)
+        pkg_check_modules(DBUS QUIET IMPORTED_TARGET dbus-1)
+        pkg_check_modules(LIBEI QUIET IMPORTED_TARGET libei-1.0)
+    endif()
+
+    set(SMU_VENDORED_SDL3_DIR "${SMU_THIRD_PARTY_DIR}/SDL")
+    if(EXISTS "${SMU_VENDORED_SDL3_DIR}/CMakeLists.txt")
+        message(STATUS "Using vendored SDL3 from ${SMU_VENDORED_SDL3_DIR}")
+
+        if(SMU_LINK_SDL3_STATIC)
+            set(SDL_SHARED OFF CACHE BOOL "Build a shared version of the library" FORCE)
+            set(SDL_STATIC ON CACHE BOOL "Build a static version of the library" FORCE)
+        else()
+            set(SDL_SHARED ON CACHE BOOL "Build a shared version of the library" FORCE)
+            set(SDL_STATIC OFF CACHE BOOL "Build a static version of the library" FORCE)
+        endif()
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "Build the SDL3_test library" FORCE)
+        set(SDL_TESTS OFF CACHE BOOL "Build the test directory" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "Build the examples directory" FORCE)
+        set(SDL_INSTALL OFF CACHE BOOL "Enable installation of SDL3" FORCE)
+        set(SDL_INSTALL_DOCS OFF CACHE BOOL "Install docs for SDL3" FORCE)
+        set(SDL_INSTALL_TESTS OFF CACHE BOOL "Install test-cases" FORCE)
+        set(SDL_UNINSTALL OFF CACHE BOOL "Enable uninstallation of SDL3" FORCE)
+
+        add_subdirectory("${SMU_VENDORED_SDL3_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/_deps/sdl3-build" EXCLUDE_FROM_ALL)
+    else()
+        find_package(SDL3 REQUIRED CONFIG)
+    endif()
+
+    set(SMU_LINUX_PLATFORM_SOURCES
+        "${SMU_PLATFORM_DIR}/input_backend.cpp"
+        "${SMU_PLATFORM_DIR}/logging.cpp"
+        "${SMU_PLATFORM_DIR}/network_backend.cpp"
+        "${SMU_PLATFORM_DIR}/platform_capabilities.cpp"
+        "${SMU_PLATFORM_DIR}/process_backend.cpp"
+        "${SMU_PLATFORM_DIR}/roblox_log_reader.cpp"
+        "${SMU_PLATFORM_DIR}/text_input_backend.cpp"
+        "${SMU_PLATFORM_DIR}/window_backend.cpp"
+        "${SMU_PLATFORM_LINUX_DIR}/display_server.cpp"
+        "${SMU_PLATFORM_LINUX_DIR}/foreground_x11.cpp"
+        "${SMU_PLATFORM_LINUX_DIR}/input_evdev_uinput.cpp"
+        "${SMU_PLATFORM_LINUX_DIR}/input_permissions.cpp"
+        "${SMU_PLATFORM_LINUX_DIR}/process_proc_cgroup.cpp"
+        "${SMU_PLATFORM_LINUX_DIR}/wayland_screencast.cpp"
+    )
+
+    add_library(smu_platform_linux STATIC ${SMU_LINUX_PLATFORM_SOURCES})
+
+    target_include_directories(smu_platform_linux PRIVATE
+        "${SMU_PLATFORM_DIR}"
+        "${SMU_IMGUI_DIR}"
+        "${SMU_MINIZ_DIR}"
+        "${SMU_JSON_DIR}"
+    )
+
+    target_link_libraries(smu_platform_linux PRIVATE Threads::Threads)
+
+    if(TARGET PkgConfig::PIPEWIRE AND TARGET PkgConfig::DBUS)
+        set(SMU_WAYLAND_SCREENCAST_ENABLED ON CACHE INTERNAL "Whether this build includes Wayland ScreenCast support")
+        target_compile_definitions(smu_platform_linux PRIVATE SMU_HAS_WAYLAND_SCREENCAST=1)
+        target_link_libraries(smu_platform_linux PRIVATE PkgConfig::PIPEWIRE PkgConfig::DBUS)
+        if(TARGET PkgConfig::LIBEI)
+            set(SMU_WAYLAND_EIS_ENABLED ON CACHE INTERNAL "Whether this build includes Wayland RemoteDesktop EIS support")
+            target_compile_definitions(smu_platform_linux PRIVATE SMU_HAS_LIBEI=1)
+            target_link_libraries(smu_platform_linux PRIVATE PkgConfig::LIBEI)
+        else()
+            set(SMU_WAYLAND_EIS_ENABLED OFF CACHE INTERNAL "Whether this build includes Wayland RemoteDesktop EIS support")
+            target_compile_definitions(smu_platform_linux PRIVATE SMU_HAS_LIBEI=0)
+            if(SMU_REQUIRE_WAYLAND_SCREENCAST)
+                message(FATAL_ERROR
+                    "Wayland ScreenCast support is required, but libei-1.0 development files were not found. "
+                    "Install libei development files, or configure with -DSMU_REQUIRE_WAYLAND_SCREENCAST=OFF for a development build.")
+            endif()
+            message(WARNING "libei development files were not found; Wayland RemoteDesktop will use the legacy D-Bus absolute-pointer compatibility path.")
+        endif()
+    else()
+        if(SMU_REQUIRE_WAYLAND_SCREENCAST)
+            message(FATAL_ERROR
+                "Wayland ScreenCast support is required, but libpipewire-0.3 and/or dbus-1 development files were not found. "
+                "Install the PipeWire and D-Bus development packages, or configure with -DSMU_REQUIRE_WAYLAND_SCREENCAST=OFF for a development build.")
+        endif()
+        set(SMU_WAYLAND_SCREENCAST_ENABLED OFF CACHE INTERNAL "Whether this build includes Wayland ScreenCast support")
+        set(SMU_WAYLAND_EIS_ENABLED OFF CACHE INTERNAL "Whether this build includes Wayland RemoteDesktop EIS support")
+        target_compile_definitions(smu_platform_linux PRIVATE SMU_HAS_WAYLAND_SCREENCAST=0)
+        target_compile_definitions(smu_platform_linux PRIVATE SMU_HAS_LIBEI=0)
+        message(WARNING "PipeWire and D-Bus development files were not found; Wayland ScreenCast pixel reads will compile as unavailable.")
+    endif()
+
+    if(X11_FOUND)
+        target_compile_definitions(smu_platform_linux PRIVATE SMU_HAS_X11=1)
+        target_link_libraries(smu_platform_linux PRIVATE X11::X11)
+        if(X11_Xinerama_FOUND)
+            target_compile_definitions(smu_platform_linux PRIVATE SMU_HAS_XINERAMA=1)
+            target_include_directories(smu_platform_linux PRIVATE ${X11_Xinerama_INCLUDE_PATH})
+            target_link_libraries(smu_platform_linux PRIVATE ${X11_Xinerama_LIB})
+        else()
+            target_compile_definitions(smu_platform_linux PRIVATE SMU_HAS_XINERAMA=0)
+        endif()
+    else()
+        target_compile_definitions(smu_platform_linux PRIVATE SMU_HAS_X11=0 SMU_HAS_XINERAMA=0)
+        message(WARNING "X11 development files were not found; Linux foreground detection, moveMouseAbs cursor queries, and getPixelColor screen reads will compile as unsupported.")
+    endif()
+
+    set(SMU_LINUX_APP_SOURCES
+        "${SMU_IMGUI_DIR}/imgui.cpp"
+        "${SMU_IMGUI_DIR}/imgui_demo.cpp"
+        "${SMU_IMGUI_DIR}/imgui_draw.cpp"
+        "${SMU_IMGUI_DIR}/imgui_impl_opengl3.cpp"
+        "${SMU_IMGUI_DIR}/imgui_impl_sdl3.cpp"
+        "${SMU_IMGUI_DIR}/imgui_tables.cpp"
+        "${SMU_IMGUI_DIR}/imgui_widgets.cpp"
+        "${SMU_APP_DIR}/app_assets.cpp"
+        "${SMU_APP_DIR}/app_context.cpp"
+        "${SMU_APP_DIR}/askpass.cpp"
+        "${SMU_APP_DIR}/app_main.cpp"
+        "${SMU_APP_DIR}/app_profile_bridge.cpp"
+        "${SMU_APP_DIR}/app_theme_bridge.cpp"
+        "${SMU_APP_DIR}/app_ui.cpp"
+        "${SMU_APP_DIR}/input_actions.cpp"
+        "${SMU_APP_DIR}/linux_lagswitch_helper.cpp"
+        "${SMU_APP_DIR}/macro_runtime.cpp"
+        "${SMU_APP_DIR}/macro_tutorial_assets.cpp"
+        "${SMU_APP_DIR}/main_linux.cpp"
+        "${SMU_APP_DIR}/profile_manager.cpp"
+        "${SMU_APP_DIR}/script_api.cpp"
+        "${SMU_APP_DIR}/script_instance.cpp"
+        "${SMU_APP_DIR}/script_manager.cpp"
+        "${SMU_APP_DIR}/script_metadata.cpp"
+        "${SMU_APP_DIR}/theme_manager.cpp"
+        "${SMU_CORE_DIR}/app_state.cpp"
+        "${SMU_CORE_DIR}/macro_state.cpp"
+        "${SMU_PLATFORM_DIR}/file_dialog.cpp"
+        "${SMU_PLATFORM_LINUX_DIR}/file_dialog_linux.cpp"
+        "${SMU_UPDATER_DIR}/updater.cpp"
+        "${SMU_UPDATER_DIR}/linux_updater.cpp"
+        "${SMU_IMGUIFILEDIALOG_DIR}/ImGuiFileDialog.cpp"
+        "${SMU_MINIZ_DIR}/miniz.c"
+    )
+
+    if(BUILD_TESTING)
+        add_executable(smu_linux_updater_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/linux_updater_test.cpp"
+            "${SMU_UPDATER_DIR}/updater.cpp"
+            "${SMU_UPDATER_DIR}/linux_updater.cpp"
+            "${SMU_MINIZ_DIR}/miniz.c"
+        )
+        target_include_directories(smu_linux_updater_test PRIVATE
+            "${SMU_UPDATER_DIR}"
+            "${SMU_MINIZ_DIR}"
+            "${SMU_JSON_DIR}"
+        )
+        add_test(NAME linux-updater COMMAND smu_linux_updater_test)
+    endif()
+
+    add_executable(suspend ${SMU_LINUX_APP_SOURCES})
+
+    target_include_directories(suspend PRIVATE
+        "${SMU_APP_DIR}"
+        "${SMU_CORE_DIR}"
+        "${SMU_IMGUI_DIR}"
+        "${SMU_IMGUIFILEDIALOG_DIR}"
+        "${SMU_MINIZ_DIR}"
+        "${SMU_JSON_DIR}"
+    )
+
+    target_compile_definitions(suspend PRIVATE SMU_PORTABLE_GLOBALS=1)
+    if(SMU_ENABLE_SOURCE_TREE_FALLBACK)
+        target_compile_definitions(suspend PRIVATE "SMU_SOURCE_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
+    endif()
+
+    if(SMU_LINK_SDL3_STATIC)
+        if(TARGET SDL3::SDL3-static)
+            set(SMU_SDL3_TARGET SDL3::SDL3-static)
+        elseif(TARGET SDL3-static)
+            set(SMU_SDL3_TARGET SDL3-static)
+        elseif(TARGET SDL3::SDL3)
+            set(SMU_SDL3_TARGET SDL3::SDL3)
+        else()
+            message(FATAL_ERROR "SMU_LINK_SDL3_STATIC is enabled, but no usable SDL3 static target is available.")
+        endif()
+    elseif(TARGET SDL3::SDL3)
+        set(SMU_SDL3_TARGET SDL3::SDL3)
+    elseif(TARGET SDL3::SDL3-shared)
+        set(SMU_SDL3_TARGET SDL3::SDL3-shared)
+    else()
+        message(FATAL_ERROR "SDL3 package was found, but no usable SDL3 imported target is available.")
+    endif()
+
+    target_link_libraries(suspend PRIVATE
+        lua_static
+        smu_platform_linux
+        ${SMU_SDL3_TARGET}
+        OpenGL::GL
+        Threads::Threads
+    )
+
+    if(BUILD_TESTING)
+        add_executable(smu_profile_persistence_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/profile_persistence_test.cpp"
+            "${SMU_APP_DIR}/profile_manager.cpp"
+            "${SMU_PLATFORM_DIR}/logging.cpp"
+        )
+        target_include_directories(smu_profile_persistence_test PRIVATE
+            "${SMU_APP_DIR}"
+            "${SMU_CORE_DIR}"
+            "${SMU_IMGUI_DIR}"
+            "${SMU_JSON_DIR}"
+            "${SMU_GENERATED_DIR}"
+        )
+        target_compile_definitions(smu_profile_persistence_test PRIVATE SMU_PORTABLE_GLOBALS=1)
+        target_compile_options(smu_profile_persistence_test PRIVATE -ffunction-sections -fdata-sections)
+        target_link_options(smu_profile_persistence_test PRIVATE -Wl,--gc-sections)
+        target_link_libraries(smu_profile_persistence_test PRIVATE
+            smu_platform_linux
+            ${SMU_SDL3_TARGET}
+            OpenGL::GL
+            Threads::Threads
+        )
+        add_test(NAME profile-persistence COMMAND smu_profile_persistence_test)
+    endif()
+
+    if(SMU_BUNDLE_SDL3 AND NOT SMU_LINK_SDL3_STATIC)
+        set_target_properties(suspend PROPERTIES
+            BUILD_RPATH "$ORIGIN/lib"
+            BUILD_WITH_INSTALL_RPATH TRUE
+            INSTALL_RPATH "$ORIGIN/lib"
+            INSTALL_RPATH_USE_LINK_PATH FALSE
+        )
+    endif()
+
+    set(SMU_LINUX_FONT_ASSET "${SMU_ASSETS_DIR}/LSANS.TTF")
+    set(SMU_LINUX_ICON_ASSET "${SMU_ASSETS_DIR}/smu_icon.bmp")
+    set(SMU_LINUX_NETHELPER_SOURCE_DIR "${SMU_PLATFORM_LINUX_DIR}/nethelper")
+    set(SMU_LINUX_NETHELPER_BINARY "${CMAKE_CURRENT_BINARY_DIR}/nethelper")
+    set(SMU_LINUX_NETHELPER_GO_CACHE "${CMAKE_CURRENT_BINARY_DIR}/go-build-cache")
+    set(SMU_LINUX_NETHELPER_GO_TMP "${CMAKE_CURRENT_BINARY_DIR}/go-tmp")
+
+    find_program(SMU_GO_EXECUTABLE go)
+    if(SMU_GO_EXECUTABLE)
+        add_custom_command(
+            OUTPUT "${SMU_LINUX_NETHELPER_BINARY}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${SMU_LINUX_NETHELPER_GO_CACHE}" "${SMU_LINUX_NETHELPER_GO_TMP}"
+            COMMAND "${CMAKE_COMMAND}" -E env
+                GOOS=linux
+                CGO_ENABLED=0
+                GOCACHE=${SMU_LINUX_NETHELPER_GO_CACHE}
+                GOTMPDIR=${SMU_LINUX_NETHELPER_GO_TMP}
+                "${SMU_GO_EXECUTABLE}" build
+                    -mod=vendor
+                    -trimpath
+                    -buildvcs=false
+                    "-ldflags=-s -w"
+                    -o "${SMU_LINUX_NETHELPER_BINARY}"
+                    .
+            WORKING_DIRECTORY "${SMU_LINUX_NETHELPER_SOURCE_DIR}"
+            DEPENDS
+                "${SMU_LINUX_NETHELPER_SOURCE_DIR}/go.mod"
+                "${SMU_LINUX_NETHELPER_SOURCE_DIR}/go.sum"
+                "${SMU_LINUX_NETHELPER_SOURCE_DIR}/nethelper.go"
+            COMMENT "Building Linux nethelper"
+            VERBATIM
+        )
+        add_custom_target(smu_linux_nethelper DEPENDS "${SMU_LINUX_NETHELPER_BINARY}")
+        add_dependencies(suspend smu_linux_nethelper)
+    else()
+        message(WARNING "Go was not found; Linux lagswitch nethelper will not be built next to suspend.")
+    endif()
+
+    add_custom_command(TARGET suspend POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:suspend>/assets"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:suspend>/scripts"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:suspend>/licenses"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_LINUX_FONT_ASSET}" "$<TARGET_FILE_DIR:suspend>/assets/LSANS.TTF"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_LINUX_ICON_ASSET}" "$<TARGET_FILE_DIR:suspend>/assets/smu_icon.bmp"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory "${SMU_MACRO_TUTORIAL_ASSETS_DIR}" "$<TARGET_FILE_DIR:suspend>/assets/macro_tutorials"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_linux_permissions.sh" "$<TARGET_FILE_DIR:suspend>/scripts/install_linux_permissions.sh"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/LINUX_SETUP.md" "$<TARGET_FILE_DIR:suspend>/LINUX_SETUP.md"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_LICENSE_FILE}" "$<TARGET_FILE_DIR:suspend>/LICENSE"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_PRIVACY_FILE}" "$<TARGET_FILE_DIR:suspend>/PRIVACY.md"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_THIRD_PARTY_NOTICES_FILE}" "$<TARGET_FILE_DIR:suspend>/THIRD_PARTY_NOTICES.md"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_SDL_LICENSE_FILE}" "$<TARGET_FILE_DIR:suspend>/licenses/SDL.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_APPIMAGE_RUNTIME_LICENSE_FILE}" "$<TARGET_FILE_DIR:suspend>/licenses/AppImage-type2-runtime.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_GO_IPTABLES_LICENSE_FILE}" "$<TARGET_FILE_DIR:suspend>/licenses/go-iptables-LICENSE.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_GO_IPTABLES_NOTICE_FILE}" "$<TARGET_FILE_DIR:suspend>/licenses/go-iptables-NOTICE.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_WINDIVERT_LICENSE_FILE}" "$<TARGET_FILE_DIR:suspend>/licenses/WinDivert-LGPL-3.0.txt"
+        COMMAND chmod 755 "$<TARGET_FILE_DIR:suspend>/scripts/install_linux_permissions.sh"
+        COMMENT "Copying Linux runtime assets next to suspend"
+    )
+
+    if(SMU_BUNDLE_SDL3 AND NOT SMU_LINK_SDL3_STATIC)
+        add_custom_command(TARGET suspend POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:suspend>/lib"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:${SMU_SDL3_TARGET}>" "$<TARGET_FILE_DIR:suspend>/lib/$<TARGET_FILE_NAME:${SMU_SDL3_TARGET}>"
+            COMMAND "${CMAKE_COMMAND}" -E rm -f "$<TARGET_FILE_DIR:suspend>/lib/$<TARGET_SONAME_FILE_NAME:${SMU_SDL3_TARGET}>"
+            COMMAND "${CMAKE_COMMAND}" -E create_symlink "$<TARGET_FILE_NAME:${SMU_SDL3_TARGET}>" "$<TARGET_FILE_DIR:suspend>/lib/$<TARGET_SONAME_FILE_NAME:${SMU_SDL3_TARGET}>"
+            COMMENT "Bundling SDL3 shared library next to suspend"
+        )
+    endif()
+
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/run.sh.in" "${CMAKE_CURRENT_BINARY_DIR}/generated/run.sh" @ONLY)
+
+    install(TARGETS suspend RUNTIME DESTINATION ".")
+    install(FILES "${SMU_LINUX_FONT_ASSET}" DESTINATION "assets" RENAME "LSANS.TTF")
+    install(FILES "${SMU_LINUX_ICON_ASSET}" DESTINATION "assets" RENAME "smu_icon.bmp")
+    install(DIRECTORY "${SMU_MACRO_TUTORIAL_ASSETS_DIR}" DESTINATION "assets")
+    install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/generated/run.sh" DESTINATION ".")
+    install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_linux_permissions.sh" DESTINATION "scripts")
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LINUX_SETUP.md" DESTINATION ".")
+    install(FILES "${SMU_LICENSE_FILE}" "${SMU_PRIVACY_FILE}" "${SMU_THIRD_PARTY_NOTICES_FILE}" DESTINATION ".")
+    install(FILES "${SMU_SDL_LICENSE_FILE}" DESTINATION "licenses" RENAME "SDL.txt")
+    install(FILES "${SMU_APPIMAGE_RUNTIME_LICENSE_FILE}" DESTINATION "licenses" RENAME "AppImage-type2-runtime.txt")
+    install(FILES "${SMU_GO_IPTABLES_LICENSE_FILE}" DESTINATION "licenses" RENAME "go-iptables-LICENSE.txt")
+    install(FILES "${SMU_GO_IPTABLES_NOTICE_FILE}" DESTINATION "licenses" RENAME "go-iptables-NOTICE.txt")
+    install(FILES "${SMU_WINDIVERT_LICENSE_FILE}" DESTINATION "licenses" RENAME "WinDivert-LGPL-3.0.txt")
+    if(SMU_GO_EXECUTABLE)
+        install(PROGRAMS "${SMU_LINUX_NETHELPER_BINARY}" DESTINATION ".")
+    endif()
+    if(SMU_BUNDLE_SDL3 AND NOT SMU_LINK_SDL3_STATIC)
+        install(FILES
+            "$<TARGET_FILE:${SMU_SDL3_TARGET}>"
+            "$<TARGET_SONAME_FILE:${SMU_SDL3_TARGET}>"
+            DESTINATION "lib"
+        )
+    endif()
+
+    set(SMU_LINUX_PACKAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/SpencerMacroUtilities")
+    add_custom_target(package-linux-dir
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${SMU_LINUX_PACKAGE_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${SMU_LINUX_PACKAGE_DIR}/assets"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${SMU_LINUX_PACKAGE_DIR}/licenses"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:suspend>" "${SMU_LINUX_PACKAGE_DIR}/suspend"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_LINUX_FONT_ASSET}" "${SMU_LINUX_PACKAGE_DIR}/assets/LSANS.TTF"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_LINUX_ICON_ASSET}" "${SMU_LINUX_PACKAGE_DIR}/assets/smu_icon.bmp"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory "${SMU_MACRO_TUTORIAL_ASSETS_DIR}" "${SMU_LINUX_PACKAGE_DIR}/assets/macro_tutorials"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/generated/run.sh" "${SMU_LINUX_PACKAGE_DIR}/run.sh"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${SMU_LINUX_PACKAGE_DIR}/scripts"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_linux_permissions.sh" "${SMU_LINUX_PACKAGE_DIR}/scripts/install_linux_permissions.sh"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/LINUX_SETUP.md" "${SMU_LINUX_PACKAGE_DIR}/LINUX_SETUP.md"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_LICENSE_FILE}" "${SMU_LINUX_PACKAGE_DIR}/LICENSE"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_PRIVACY_FILE}" "${SMU_LINUX_PACKAGE_DIR}/PRIVACY.md"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_THIRD_PARTY_NOTICES_FILE}" "${SMU_LINUX_PACKAGE_DIR}/THIRD_PARTY_NOTICES.md"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_SDL_LICENSE_FILE}" "${SMU_LINUX_PACKAGE_DIR}/licenses/SDL.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_APPIMAGE_RUNTIME_LICENSE_FILE}" "${SMU_LINUX_PACKAGE_DIR}/licenses/AppImage-type2-runtime.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_GO_IPTABLES_LICENSE_FILE}" "${SMU_LINUX_PACKAGE_DIR}/licenses/go-iptables-LICENSE.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_GO_IPTABLES_NOTICE_FILE}" "${SMU_LINUX_PACKAGE_DIR}/licenses/go-iptables-NOTICE.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_WINDIVERT_LICENSE_FILE}" "${SMU_LINUX_PACKAGE_DIR}/licenses/WinDivert-LGPL-3.0.txt"
+        COMMAND chmod 755 "${SMU_LINUX_PACKAGE_DIR}/run.sh" "${SMU_LINUX_PACKAGE_DIR}/suspend" "${SMU_LINUX_PACKAGE_DIR}/scripts/install_linux_permissions.sh"
+        DEPENDS suspend
+        COMMENT "Creating portable Linux output folder at ${SMU_LINUX_PACKAGE_DIR}"
+    )
+
+    if(SMU_GO_EXECUTABLE)
+        add_dependencies(package-linux-dir smu_linux_nethelper)
+        add_custom_command(TARGET package-linux-dir POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_LINUX_NETHELPER_BINARY}" "${SMU_LINUX_PACKAGE_DIR}/nethelper"
+            COMMAND chmod 755 "${SMU_LINUX_PACKAGE_DIR}/nethelper"
+        )
+    endif()
+
+    if(SMU_BUNDLE_SDL3 AND NOT SMU_LINK_SDL3_STATIC)
+        add_custom_command(TARGET package-linux-dir POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${SMU_LINUX_PACKAGE_DIR}/lib"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:${SMU_SDL3_TARGET}>" "${SMU_LINUX_PACKAGE_DIR}/lib/$<TARGET_FILE_NAME:${SMU_SDL3_TARGET}>"
+            COMMAND "${CMAKE_COMMAND}" -E create_symlink "$<TARGET_FILE_NAME:${SMU_SDL3_TARGET}>" "${SMU_LINUX_PACKAGE_DIR}/lib/$<TARGET_SONAME_FILE_NAME:${SMU_SDL3_TARGET}>"
+        )
+    endif()
+elseif(APPLE)
+    enable_language(OBJCXX)
+
+    find_package(OpenGL REQUIRED)
+    find_package(Threads REQUIRED)
+    option(SMU_MACOS_ADHOC_SIGN_BUILD "Sign local macOS app bundles after building." ON)
+    set(SMU_MACOS_SIGN_IDENTITY "-" CACHE STRING "macOS code-signing identity for local builds; '-' uses ad-hoc signing. Official unsigned releases use the stable self-signed 'SMU macOS Release' identity.")
+    if(SMU_MACOS_ADHOC_SIGN_BUILD)
+        find_program(SMU_CODESIGN_EXECUTABLE codesign)
+    endif()
+
+    find_library(SMU_APPKIT_FRAMEWORK AppKit REQUIRED)
+    find_library(SMU_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(SMU_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+    find_library(SMU_COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
+    find_library(SMU_APPLICATIONSERVICES_FRAMEWORK ApplicationServices REQUIRED)
+    find_library(SMU_CARBON_FRAMEWORK Carbon REQUIRED)
+
+    set(SMU_VENDORED_SDL3_DIR "${SMU_THIRD_PARTY_DIR}/SDL")
+    if(EXISTS "${SMU_VENDORED_SDL3_DIR}/CMakeLists.txt")
+        message(STATUS "Using vendored SDL3 from ${SMU_VENDORED_SDL3_DIR}")
+
+        if(SMU_LINK_SDL3_STATIC)
+            set(SDL_SHARED OFF CACHE BOOL "Build a shared version of the library" FORCE)
+            set(SDL_STATIC ON CACHE BOOL "Build a static version of the library" FORCE)
+        else()
+            set(SDL_SHARED ON CACHE BOOL "Build a shared version of the library" FORCE)
+            set(SDL_STATIC OFF CACHE BOOL "Build a static version of the library" FORCE)
+        endif()
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "Build the SDL3_test library" FORCE)
+        set(SDL_TESTS OFF CACHE BOOL "Build the test directory" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "Build the examples directory" FORCE)
+        set(SDL_INSTALL OFF CACHE BOOL "Enable installation of SDL3" FORCE)
+        set(SDL_INSTALL_DOCS OFF CACHE BOOL "Install docs for SDL3" FORCE)
+        set(SDL_INSTALL_TESTS OFF CACHE BOOL "Install test-cases" FORCE)
+        set(SDL_UNINSTALL OFF CACHE BOOL "Enable uninstallation of SDL3" FORCE)
+
+        add_subdirectory("${SMU_VENDORED_SDL3_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/_deps/sdl3-build" EXCLUDE_FROM_ALL)
+    else()
+        find_package(SDL3 REQUIRED CONFIG)
+    endif()
+
+    set(SMU_MACOS_ICON_ASSET "${SMU_ASSETS_DIR}/smu_icon.icns")
+    set_source_files_properties("${SMU_MACOS_ICON_ASSET}" PROPERTIES
+        MACOSX_PACKAGE_LOCATION "Resources"
+    )
+
+    set(SMU_MACOS_PLATFORM_SOURCES
+        "${SMU_PLATFORM_DIR}/input_backend.cpp"
+        "${SMU_PLATFORM_DIR}/logging.cpp"
+        "${SMU_PLATFORM_DIR}/network_backend.cpp"
+        "${SMU_PLATFORM_DIR}/platform_capabilities.cpp"
+        "${SMU_PLATFORM_DIR}/process_backend.cpp"
+        "${SMU_PLATFORM_DIR}/roblox_log_reader.cpp"
+        "${SMU_PLATFORM_DIR}/text_input_backend.cpp"
+        "${SMU_PLATFORM_DIR}/window_backend.cpp"
+        "${SMU_PLATFORM_MACOS_DIR}/app_icon_macos.mm"
+        "${SMU_PLATFORM_MACOS_DIR}/input_cgevent.mm"
+        "${SMU_PLATFORM_MACOS_DIR}/macos_backends.cpp"
+        "${SMU_PLATFORM_MACOS_DIR}/permissions_macos.mm"
+        "${SMU_PLATFORM_MACOS_DIR}/process_macos.mm"
+    )
+
+    add_library(smu_platform_macos STATIC ${SMU_MACOS_PLATFORM_SOURCES})
+
+    target_include_directories(smu_platform_macos PRIVATE
+        "${SMU_PLATFORM_DIR}"
+        "${SMU_PLATFORM_MACOS_DIR}"
+        "${SMU_IMGUI_DIR}"
+        "${SMU_MINIZ_DIR}"
+        "${SMU_JSON_DIR}"
+    )
+
+    target_link_libraries(smu_platform_macos PRIVATE Threads::Threads)
+
+    set(SMU_MACOS_APP_SOURCES
+        "${SMU_IMGUI_DIR}/imgui.cpp"
+        "${SMU_IMGUI_DIR}/imgui_demo.cpp"
+        "${SMU_IMGUI_DIR}/imgui_draw.cpp"
+        "${SMU_IMGUI_DIR}/imgui_impl_opengl3.cpp"
+        "${SMU_IMGUI_DIR}/imgui_impl_sdl3.cpp"
+        "${SMU_IMGUI_DIR}/imgui_tables.cpp"
+        "${SMU_IMGUI_DIR}/imgui_widgets.cpp"
+        "${SMU_APP_DIR}/app_assets.cpp"
+        "${SMU_APP_DIR}/app_context.cpp"
+        "${SMU_APP_DIR}/app_main.cpp"
+        "${SMU_APP_DIR}/app_profile_bridge.cpp"
+        "${SMU_APP_DIR}/app_theme_bridge.cpp"
+        "${SMU_APP_DIR}/app_ui.cpp"
+        "${SMU_APP_DIR}/input_actions.cpp"
+        "${SMU_APP_DIR}/macro_runtime.cpp"
+        "${SMU_APP_DIR}/macro_tutorial_assets.cpp"
+        "${SMU_APP_DIR}/main_macos.cpp"
+        "${SMU_APP_DIR}/profile_manager.cpp"
+        "${SMU_APP_DIR}/script_api.cpp"
+        "${SMU_APP_DIR}/script_instance.cpp"
+        "${SMU_APP_DIR}/script_manager.cpp"
+        "${SMU_APP_DIR}/script_metadata.cpp"
+        "${SMU_APP_DIR}/theme_manager.cpp"
+        "${SMU_CORE_DIR}/app_state.cpp"
+        "${SMU_CORE_DIR}/macro_state.cpp"
+        "${SMU_PLATFORM_DIR}/file_dialog.cpp"
+        "${SMU_PLATFORM_MACOS_DIR}/file_dialog_macos.mm"
+        "${SMU_PLATFORM_MACOS_DIR}/termination_handler.mm"
+        "${SMU_UPDATER_DIR}/updater.cpp"
+        "${SMU_UPDATER_DIR}/macos_updater.cpp"
+        "${SMU_IMGUIFILEDIALOG_DIR}/ImGuiFileDialog.cpp"
+        "${SMU_MINIZ_DIR}/miniz.c"
+        "${SMU_MACOS_ICON_ASSET}"
+    )
+
+    add_executable(suspend MACOSX_BUNDLE ${SMU_MACOS_APP_SOURCES})
+
+    target_include_directories(suspend PRIVATE
+        "${SMU_APP_DIR}"
+        "${SMU_CORE_DIR}"
+        "${SMU_PLATFORM_DIR}"
+        "${SMU_PLATFORM_MACOS_DIR}"
+        "${SMU_IMGUI_DIR}"
+        "${SMU_IMGUIFILEDIALOG_DIR}"
+        "${SMU_MINIZ_DIR}"
+        "${SMU_JSON_DIR}"
+    )
+
+    target_compile_definitions(suspend PRIVATE SMU_PORTABLE_GLOBALS=1)
+    if(SMU_ENABLE_SOURCE_TREE_FALLBACK)
+        target_compile_definitions(suspend PRIVATE "SMU_SOURCE_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
+    endif()
+
+    if(SMU_LINK_SDL3_STATIC)
+        if(TARGET SDL3::SDL3-static)
+            set(SMU_SDL3_TARGET SDL3::SDL3-static)
+        elseif(TARGET SDL3-static)
+            set(SMU_SDL3_TARGET SDL3-static)
+        elseif(TARGET SDL3::SDL3)
+            set(SMU_SDL3_TARGET SDL3::SDL3)
+        else()
+            message(FATAL_ERROR "SMU_LINK_SDL3_STATIC is enabled, but no usable SDL3 static target is available.")
+        endif()
+    elseif(TARGET SDL3::SDL3)
+        set(SMU_SDL3_TARGET SDL3::SDL3)
+    elseif(TARGET SDL3::SDL3-shared)
+        set(SMU_SDL3_TARGET SDL3::SDL3-shared)
+    else()
+        message(FATAL_ERROR "SDL3 package was found, but no usable SDL3 imported target is available.")
+    endif()
+
+    target_link_libraries(suspend PRIVATE
+        lua_static
+        smu_platform_macos
+        ${SMU_SDL3_TARGET}
+        OpenGL::GL
+        Threads::Threads
+        ${SMU_APPKIT_FRAMEWORK}
+        ${SMU_FOUNDATION_FRAMEWORK}
+        ${SMU_COREFOUNDATION_FRAMEWORK}
+        ${SMU_COREGRAPHICS_FRAMEWORK}
+        ${SMU_APPLICATIONSERVICES_FRAMEWORK}
+        ${SMU_CARBON_FRAMEWORK}
+    )
+
+    set_target_properties(suspend PROPERTIES
+        MACOSX_BUNDLE_BUNDLE_NAME "Spencer Macro Utilities"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.spencer0187.smu"
+        MACOSX_BUNDLE_ICON_FILE "smu_icon.icns"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/Info.plist.in"
+    )
+
+    add_custom_command(TARGET suspend POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "$<TARGET_FILE_DIR:suspend>/assets"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/assets"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/licenses"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_ASSETS_DIR}/LSANS.TTF" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/assets/LSANS.TTF"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_ASSETS_DIR}/smu_icon.bmp" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/assets/smu_icon.bmp"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory "${SMU_MACRO_TUTORIAL_ASSETS_DIR}" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/assets/macro_tutorials"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_LICENSE_FILE}" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/LICENSE"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_PRIVACY_FILE}" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/PRIVACY.md"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_THIRD_PARTY_NOTICES_FILE}" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/THIRD_PARTY_NOTICES.md"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_SDL_LICENSE_FILE}" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/licenses/SDL.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_APPIMAGE_RUNTIME_LICENSE_FILE}" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/licenses/AppImage-type2-runtime.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_GO_IPTABLES_LICENSE_FILE}" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/licenses/go-iptables-LICENSE.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_GO_IPTABLES_NOTICE_FILE}" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/licenses/go-iptables-NOTICE.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SMU_WINDIVERT_LICENSE_FILE}" "$<TARGET_BUNDLE_CONTENT_DIR:suspend>/Resources/licenses/WinDivert-LGPL-3.0.txt"
+        COMMENT "Copying macOS runtime assets into suspend.app Resources"
+    )
+
+    if(SMU_CODESIGN_EXECUTABLE)
+        add_custom_command(TARGET suspend POST_BUILD
+            COMMAND "${SMU_CODESIGN_EXECUTABLE}" --force --deep --sign "${SMU_MACOS_SIGN_IDENTITY}" "$<TARGET_BUNDLE_DIR:suspend>"
+            COMMAND "${SMU_CODESIGN_EXECUTABLE}" --verify --deep --strict --verbose=2 "$<TARGET_BUNDLE_DIR:suspend>"
+            COMMENT "Signing macOS app bundle for local TCC identity"
+        )
+    endif()
+else()
+    message(FATAL_ERROR "Unsupported platform for the suspend target.")
+endif()

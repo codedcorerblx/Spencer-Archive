@@ -1,0 +1,3765 @@
+#include "app_ui.h"
+
+#include "app_profile_bridge.h"
+#include "app_theme_bridge.h"
+#include "input_actions.h"
+#include "linux_lagswitch_helper.h"
+#include "macro_tutorial_assets.h"
+#include "script_instance.h"
+#include "script_manager.h"
+#include "../platform/file_dialog.h"
+#include "../core/key_codes.h"
+#include "../platform/input_backend.h"
+#include "../platform/logging.h"
+#include "../platform/network_backend.h"
+#include "../platform/process_backend.h"
+#include "../platform/updater/updater.h"
+
+#include "../core/legacy_globals.h"
+#include "../core/app_state.h"
+
+#if defined(_WIN32)
+#include "../platform/windows/admin_elevation.h"
+#include "../platform/windows/lagswitch_overlay.h"
+#endif
+
+#include "imgui.h"
+#include "ImGuiFileDialog.h"
+#include <SDL3/SDL_clipboard.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace smu::app {
+namespace {
+
+using namespace Globals;
+
+std::string SanitizePathForDisplay(const std::filesystem::path& path)
+{
+    std::string fullPath = path.string();
+
+#if defined(_WIN32)
+    char* buffer = nullptr;
+    size_t size = 0;
+    if (_dupenv_s(&buffer, &size, "USERNAME") != 0 || !buffer || size == 0) {
+        return fullPath;
+    }
+    std::string username = buffer;
+    free(buffer);
+    
+    // Replace "C:\Users\<actual_username>" with "C:\Users\%USERNAME%"
+    std::string userPrefix = "C:\\Users\\" + username;
+    std::string sanitizedPrefix = "C:\\Users\\%USERNAME%";
+    
+    if (fullPath.size() >= userPrefix.size()) {
+        if (fullPath.substr(0, userPrefix.size()) == userPrefix) {
+            return sanitizedPrefix + fullPath.substr(userPrefix.size());
+        }
+    }
+#else
+    const char* homeDir = std::getenv("HOME");
+    if (!homeDir) {
+        return fullPath;
+    }
+    
+    // Replace the home directory path with $HOME
+    std::string homeDirStr = homeDir;
+    if (fullPath.size() >= homeDirStr.size()) {
+        if (fullPath.substr(0, homeDirStr.size()) == homeDirStr) {
+            return "$HOME" + fullPath.substr(homeDirStr.size());
+        }
+    }
+#endif
+
+    return fullPath;
+}
+
+const char* optionsforoffset[] = {"/e dance2", "/e laugh", "/e cheer"};
+
+const char* kForegroundFallbackTooltip =
+    "Foreground Roblox window detection is unavailable on this display server. This usually happens on Wayland because apps cannot reliably inspect other apps' active windows. This macro has been forced to always-active mode.";
+
+struct Section {
+    std::string title;
+    std::string description;
+    bool optionA = false;
+    float settingValue = 50.0f;
+};
+
+struct SectionConfig {
+    const char* title;
+    const char* description;
+};
+
+std::vector<Section> sections;
+
+std::array<SectionConfig, section_amounts> SECTION_CONFIGS = {{
+    {"Freeze", "Freeze the Roblox process."},
+    {"Item Desync", "Desynchronize a held item from the client and server."},
+    {"Wall Helicopter High Jump", "Use COM offset to launch yourself high into the air."},
+    {"Speedglitch", "Use COM offset to gain extreme midair speed."},
+    {"Item Unequip COM Offset", "Create a COM offset by using an emote and unequipping an item."},
+    {"Press a Button", "Press another key for a short moment."},
+    {"Wallhop/Rotation", "Flick and jump automatically to perform wallhops."},
+    {"Walless LHJ", "Perform a lag high jump without using a wall."},
+    {"Item Clip", "Clip through thin walls using item equip timing."},
+    {"Laugh Clip", "Perform a laugh clip automatically."},
+    {"Wall-Walk", "Walk along wall seams without jumping."},
+    {"Spam a Key", "Spam a selected key while the macro is active."},
+    {"Ledge Bounce", "Drop from a ledge and bounce back with timed camera movement."},
+    {"Smart Bunnyhop", "Automatically bunnyhop while avoiding chat/input conflicts."},
+    {"Floor Bounce", "Perform a high jump from flat ground."},
+    {"Lag Switch", "Temporarily block or delay Roblox network traffic."}
+}};
+
+struct BindingState {
+    bool bindingMode = false;
+    bool notBinding = true;
+    std::chrono::steady_clock::time_point rebindTime{};
+    char keyBuffer[64] = "0x00";
+    char keyBufferHuman[64] = "None";
+    std::string buttonText = "Click to Bind Key";
+    bool firstRun = true;
+    bool waitingForReleaseBeforeCapture = false;
+    std::array<bool, 258> keyWasPressed{};
+    unsigned int pendingModifierKey = 0;
+    unsigned int pendingModifierCombo = 0;
+    int lastSelectedSection = -1;
+};
+
+std::unordered_map<unsigned int*, BindingState> g_bindingStates;
+bool g_hasStoredSettingsWindowPos = false;
+ImVec2 g_storedSettingsWindowPos{};
+int g_selected_imported_script = -1;
+std::optional<std::filesystem::path> g_pending_import_path;
+
+struct ImportPreviewState {
+    std::string content;
+    std::vector<std::size_t> lineOffsets;
+    std::string error;
+};
+
+struct ImportPreviewPalette {
+    ImU32 normal = 0;
+    ImU32 keyword = 0;
+    ImU32 stringLiteral = 0;
+    ImU32 comment = 0;
+    ImU32 functionCall = 0;
+    ImU32 riskyFunctionCall = 0;
+    ImU32 metadataTag = 0;
+};
+
+ImportPreviewState g_import_preview;
+bool g_open_import_trust_modal = false;
+bool g_script_file_dialog_open = false;
+std::string g_import_error;
+
+constexpr std::array<const char*, 22> kLuaKeywords = {{
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
+    "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return",
+    "then", "true", "until", "while"
+}};
+
+constexpr std::array<const char*, 16> kRiskyLuaFunctions = {{
+    "pressKey", "clickMouse", "holdKey", "releaseKey", "typeText", "moveMouse",
+    "moveMouseAbs", "moveDegrees", "mouseWheel", "freeze", "lagSwitch",
+    "setLagSwitchConfig", "clearLagSwitchConfig", "robloxFreeze", "roblox_freeze",
+    "lagswitch"
+}};
+
+void ClearImportPreview()
+{
+    g_import_preview = {};
+}
+
+bool IsLuaIdentifierStart(char ch)
+{
+    const unsigned char value = static_cast<unsigned char>(ch);
+    return std::isalpha(value) != 0 || ch == '_';
+}
+
+bool IsLuaIdentifierChar(char ch)
+{
+    const unsigned char value = static_cast<unsigned char>(ch);
+    return std::isalnum(value) != 0 || ch == '_';
+}
+
+bool IsHorizontalWhitespace(char ch)
+{
+    return ch == ' ' || ch == '\t';
+}
+
+template <std::size_t N>
+bool MatchesWord(const std::array<const char*, N>& words, const char* begin, std::size_t length)
+{
+    for (const char* word : words) {
+        if (std::strlen(word) != length) {
+            continue;
+        }
+        if (std::memcmp(begin, word, length) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void BuildImportPreviewLineOffsets(ImportPreviewState& preview)
+{
+    preview.lineOffsets.clear();
+    preview.lineOffsets.push_back(0);
+    for (std::size_t index = 0; index < preview.content.size(); ++index) {
+        if (preview.content[index] == '\n') {
+            preview.lineOffsets.push_back(index + 1);
+        }
+    }
+}
+
+ImportPreviewState LoadImportPreview(const std::filesystem::path& path)
+{
+    ImportPreviewState preview;
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        preview.error = "Preview unavailable: could not read the selected file.";
+        return preview;
+    }
+
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    if (!file.good() && !file.eof()) {
+        preview.error = "Preview unavailable: file read failed before the preview could be loaded.";
+        return preview;
+    }
+
+    preview.content = buffer.str();
+    if (!preview.content.empty() && std::memchr(preview.content.data(), '\0', preview.content.size()) != nullptr) {
+        preview.error = "Preview unavailable: the selected file contains embedded NUL bytes.";
+        return preview;
+    }
+
+    BuildImportPreviewLineOffsets(preview);
+    return preview;
+}
+
+float DrawImportPreviewSegment(float x, float y, ImU32 color, const char* begin, const char* end)
+{
+    if (!begin || !end || begin >= end) {
+        return x;
+    }
+
+    ImGui::GetWindowDrawList()->AddText(ImVec2(x, y), color, begin, end);
+    return x + ImGui::CalcTextSize(begin, end).x;
+}
+
+void RenderImportPreviewLine(const char* begin, const char* end, const ImportPreviewPalette& palette)
+{
+    if (!begin || !end || begin > end) {
+        ImGui::Dummy(ImVec2(1.0f, ImGui::GetTextLineHeightWithSpacing()));
+        return;
+    }
+
+    ImVec2 cursor = ImGui::GetCursorScreenPos();
+    float x = cursor.x;
+    const float y = cursor.y;
+    const char* current = begin;
+
+    while (current < end) {
+        if (current + 1 < end && current[0] == '-' && current[1] == '-') {
+            const char* afterPrefix = current + 2;
+            while (afterPrefix < end && IsHorizontalWhitespace(*afterPrefix)) {
+                ++afterPrefix;
+            }
+
+            if (afterPrefix < end && *afterPrefix == '@') {
+                const char* tagEnd = afterPrefix + 1;
+                while (tagEnd < end && (IsLuaIdentifierChar(*tagEnd) || *tagEnd == '-')) {
+                    ++tagEnd;
+                }
+                if (tagEnd < end && *tagEnd == ':') {
+                    x = DrawImportPreviewSegment(x, y, palette.comment, current, afterPrefix);
+                    x = DrawImportPreviewSegment(x, y, palette.metadataTag, afterPrefix, tagEnd + 1);
+                    DrawImportPreviewSegment(x, y, palette.comment, tagEnd + 1, end);
+                    ImGui::Dummy(ImVec2(std::max(1.0f, x - cursor.x + ImGui::CalcTextSize(tagEnd + 1, end).x), ImGui::GetTextLineHeightWithSpacing()));
+                    return;
+                }
+            }
+
+            x = DrawImportPreviewSegment(x, y, palette.comment, current, end);
+            ImGui::Dummy(ImVec2(std::max(1.0f, x - cursor.x), ImGui::GetTextLineHeightWithSpacing()));
+            return;
+        }
+
+        if (*current == '"' || *current == '\'') {
+            const char quote = *current;
+            const char* tokenStart = current++;
+            bool escaped = false;
+            while (current < end) {
+                if (escaped) {
+                    escaped = false;
+                    ++current;
+                    continue;
+                }
+                if (*current == '\\') {
+                    escaped = true;
+                    ++current;
+                    continue;
+                }
+                const char value = *current++;
+                if (value == quote) {
+                    break;
+                }
+            }
+            x = DrawImportPreviewSegment(x, y, palette.stringLiteral, tokenStart, current);
+            continue;
+        }
+
+        if (IsLuaIdentifierStart(*current)) {
+            const char* tokenStart = current++;
+            while (current < end && IsLuaIdentifierChar(*current)) {
+                ++current;
+            }
+
+            const std::size_t tokenLength = static_cast<std::size_t>(current - tokenStart);
+            const char* lookahead = current;
+            while (lookahead < end && IsHorizontalWhitespace(*lookahead)) {
+                ++lookahead;
+            }
+
+            ImU32 color = palette.normal;
+            if (MatchesWord(kLuaKeywords, tokenStart, tokenLength)) {
+                color = palette.keyword;
+            } else if (lookahead < end && *lookahead == '(') {
+                color = MatchesWord(kRiskyLuaFunctions, tokenStart, tokenLength)
+                    ? palette.riskyFunctionCall
+                    : palette.functionCall;
+            }
+
+            x = DrawImportPreviewSegment(x, y, color, tokenStart, current);
+            continue;
+        }
+
+        const char* tokenStart = current++;
+        while (current < end) {
+            if ((current + 1 < end && current[0] == '-' && current[1] == '-') ||
+                *current == '"' || *current == '\'' || IsLuaIdentifierStart(*current)) {
+                break;
+            }
+            ++current;
+        }
+        x = DrawImportPreviewSegment(x, y, palette.normal, tokenStart, current);
+    }
+
+    ImGui::Dummy(ImVec2(std::max(1.0f, x - cursor.x), ImGui::GetTextLineHeightWithSpacing()));
+}
+
+void RenderImportPreview(const ImportPreviewState& preview)
+{
+    if (!preview.error.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().error_color);
+        ImGui::TextWrapped("%s", preview.error.c_str());
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    if (preview.content.empty()) {
+        ImGui::TextDisabled("The selected file is empty.");
+    }
+
+    const Theme& theme = GetCurrentTheme();
+    const auto brighten = [](ImVec4 color, float factor) {
+        return ImVec4(std::min(color.x * factor, 1.0f),
+            std::min(color.y * factor, 1.0f),
+            std::min(color.z * factor, 1.0f),
+            color.w);
+    };
+    const ImportPreviewPalette palette{
+        ImGui::ColorConvertFloat4ToU32(theme.text_primary),
+        ImGui::ColorConvertFloat4ToU32(brighten(theme.accent_primary, 1.15f)),
+        ImGui::ColorConvertFloat4ToU32(theme.success_color),
+        ImGui::ColorConvertFloat4ToU32(theme.disabled_color),
+        ImGui::ColorConvertFloat4ToU32(brighten(theme.accent_secondary, 1.15f)),
+        ImGui::ColorConvertFloat4ToU32(brighten(theme.warning_color, 1.1f)),
+        ImGui::ColorConvertFloat4ToU32(brighten(theme.accent_primary, 1.35f))
+    };
+
+    const float previewHeight = std::max(0.0f, ImGui::GetContentRegionAvail().y);
+    ImGui::BeginChild("ImportScriptPreview", ImVec2(0.0f, previewHeight), true, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+
+    const std::size_t lineCount = std::max<std::size_t>(preview.lineOffsets.size(), 1);
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(lineCount), ImGui::GetTextLineHeightWithSpacing());
+    while (clipper.Step()) {
+        for (int lineIndex = clipper.DisplayStart; lineIndex < clipper.DisplayEnd; ++lineIndex) {
+            const std::size_t beginOffset = preview.lineOffsets.empty()
+                ? 0
+                : preview.lineOffsets[static_cast<std::size_t>(lineIndex)];
+            std::size_t endOffset = preview.content.size();
+            if (!preview.lineOffsets.empty() && static_cast<std::size_t>(lineIndex + 1) < preview.lineOffsets.size()) {
+                endOffset = preview.lineOffsets[static_cast<std::size_t>(lineIndex + 1)];
+            }
+
+            if (endOffset > beginOffset && preview.content[endOffset - 1] == '\n') {
+                --endOffset;
+            }
+            if (endOffset > beginOffset && preview.content[endOffset - 1] == '\r') {
+                --endOffset;
+            }
+
+            const char* lineBegin = preview.content.empty() ? "" : preview.content.data() + beginOffset;
+            const char* lineEnd = preview.content.empty() ? lineBegin : preview.content.data() + endOffset;
+            RenderImportPreviewLine(lineBegin, lineEnd, palette);
+        }
+    }
+
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
+}
+
+bool AnyPhysicalKeyOrMouseButtonPressedForBinding()
+{
+    for (int key = 1; key <= 0xFF; ++key) {
+        if (IsKeyPressed(static_cast<smu::core::KeyCode>(key))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void StartKeybindCapture(BindingState& state)
+{
+    state.bindingMode = true;
+    state.notBinding = false;
+    state.waitingForReleaseBeforeCapture = true;
+    state.firstRun = false;
+    state.pendingModifierKey = 0;
+    state.pendingModifierCombo = 0;
+    state.keyWasPressed.fill(false);
+    state.rebindTime = std::chrono::steady_clock::now();
+    state.buttonText = "Release Keys...";
+
+    g_keybindCaptureActive.store(true, std::memory_order_release);
+    g_suppressHotkeysUntilRelease.store(true, std::memory_order_release);
+    notbinding.store(false, std::memory_order_release);
+}
+
+void FinishKeybindCapture()
+{
+    g_keybindCaptureActive.store(false, std::memory_order_release);
+    g_suppressHotkeysUntilRelease.store(true, std::memory_order_release);
+    notbinding.store(false, std::memory_order_release);
+}
+
+void RefreshFinishedKeybindSuppression()
+{
+    if (g_keybindCaptureActive.load(std::memory_order_acquire) ||
+        !g_suppressHotkeysUntilRelease.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    if (AnyPhysicalKeyOrMouseButtonPressedForBinding()) {
+        notbinding.store(false, std::memory_order_release);
+        return;
+    }
+
+    g_suppressHotkeysUntilRelease.store(false, std::memory_order_release);
+    notbinding.store(true, std::memory_order_release);
+}
+
+struct InstanceRemoveConfirmState {
+    int stage = 0;
+    float timer = 0.0f;
+    int section_index = -1;
+    int target_instance_index = -1;
+};
+
+InstanceRemoveConfirmState g_instance_remove_confirm_state{};
+
+struct UpdateUiState {
+    std::mutex mutex;
+    smu::updater::UpdaterStatus status;
+    bool checkedOnce = false;
+    bool checking = false;
+    bool applying = false;
+    bool updateConfirmOpen = false;
+    bool updatePromptDismissed = false;
+    std::string actionMessage;
+};
+
+UpdateUiState g_updateUiState;
+
+void RefreshPlatformCapabilitiesForUi(AppContext& context)
+{
+    static double nextCapabilityRefreshTime = 0.0;
+    const double now = ImGui::GetTime();
+    if (now < nextCapabilityRefreshTime) {
+        return;
+    }
+
+    nextCapabilityRefreshTime = now + 0.25;
+
+    const bool wasFallbackActive = IsForegroundDetectionFallbackActive(context);
+    context.capabilities = smu::platform::GetPlatformCapabilities();
+
+    if (!wasFallbackActive && IsForegroundDetectionFallbackActive(context)) {
+        context.foregroundFallbackWarningShown = false;
+        MaybeWarnForegroundDetectionFallback(context);
+    }
+}
+
+void InitializeSections()
+{
+    sections.clear();
+    for (const auto& config : SECTION_CONFIGS) {
+        sections.push_back({config.title, shortdescriptions ? "" : config.description, false, 50.0f});
+    }
+}
+
+void ResetInstanceRemoveConfirmState()
+{
+    g_instance_remove_confirm_state = {};
+}
+
+void RenderSelectableToastMessage(const std::string& message)
+{
+    std::vector<char> buffer(message.begin(), message.end());
+    buffer.push_back('\0');
+
+    const float availableWidth = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+    const ImVec2 textSize = ImGui::CalcTextSize(message.c_str(), nullptr, false, availableWidth);
+    const float height = std::clamp(textSize.y + ImGui::GetStyle().FramePadding.y * 2.0f, 56.0f, 220.0f);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::InputTextMultiline("##toast_message", buffer.data(), buffer.size(), ImVec2(-FLT_MIN, height),
+        ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoHorizontalScroll | ImGuiInputTextFlags_WordWrap);
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(2);
+}
+
+
+void StartUpdateCheck(bool force)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+        if (g_updateUiState.checking || g_updateUiState.applying || (g_updateUiState.checkedOnce && !force)) {
+            return;
+        }
+        if (force) {
+            g_updateUiState.updatePromptDismissed = false;
+        }
+        g_updateUiState.checking = true;
+        g_updateUiState.actionMessage = "Checking for updates...";
+    }
+
+    const std::string version = localVersion;
+    std::thread([version]() {
+        smu::updater::UpdaterStatus status = smu::updater::CheckForUpdate(version);
+        if (!status.checkSucceeded) {
+            LogWarning("Update check failed: " + status.message);
+        }
+
+        const bool shouldOpenUpdatePrompt =
+            status.checkSucceeded &&
+            status.updateAvailable &&
+            status.latestRelease.has_value();
+
+        {
+            std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+            g_updateUiState.status = std::move(status);
+            g_updateUiState.checkedOnce = true;
+            g_updateUiState.checking = false;
+            g_updateUiState.actionMessage = g_updateUiState.status.message;
+
+            if (shouldOpenUpdatePrompt && !g_updateUiState.updatePromptDismissed) {
+                g_updateUiState.updateConfirmOpen = true;
+            }
+        }
+    }).detach();
+}
+
+
+void StartApplyUpdateConfirmed()
+{
+    smu::updater::ReleaseInfo release;
+    {
+        std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+        if (g_updateUiState.applying || !g_updateUiState.status.latestRelease) {
+            return;
+        }
+        release = *g_updateUiState.status.latestRelease;
+        g_updateUiState.applying = true;
+        g_updateUiState.actionMessage = "Downloading update...";
+    }
+
+    const std::string version = localVersion;
+    std::thread([release = std::move(release), version]() {
+        std::string error;
+        const bool ok = smu::updater::ApplyUpdate(release, version, &error);
+        {
+            std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+            g_updateUiState.applying = false;
+            g_updateUiState.actionMessage = ok
+                ? "Update installer launched. The app will restart shortly."
+                : (error.empty() ? "Update failed." : error);
+        }
+        if (!ok) {
+            LogWarning(error.empty() ? "Update failed." : error);
+        }
+    }).detach();
+}
+
+void StartApplyUpdate()
+{
+    std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+
+    if (g_updateUiState.checking || g_updateUiState.applying) {
+        return;
+    }
+
+    if (!g_updateUiState.status.latestRelease || !g_updateUiState.status.updateAvailable) {
+        g_updateUiState.actionMessage = g_updateUiState.status.message.empty()
+            ? "No update is available."
+            : g_updateUiState.status.message;
+        return;
+    }
+
+    if (!g_updateUiState.status.autoApplySupported) {
+        g_updateUiState.actionMessage =
+            "An update is available, but automatic installation is not supported in this launch mode.";
+        return;
+    }
+
+    if (!g_updateUiState.status.selectedAsset) {
+        g_updateUiState.actionMessage =
+            "An update is available, but no matching package asset was found for this platform.";
+        return;
+    }
+
+    g_updateUiState.updateConfirmOpen = true;
+}
+
+void RenderUpdateConfirmationModal(AppContext& context)
+{
+    smu::updater::UpdaterStatus statusSnapshot;
+    bool shouldOpen = false;
+    bool isApplying = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+        shouldOpen = g_updateUiState.updateConfirmOpen;
+        isApplying = g_updateUiState.applying;
+        statusSnapshot = g_updateUiState.status;
+    }
+
+    if (shouldOpen) {
+        ImGui::OpenPopup("Update Available");
+    }
+
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 0.0f), ImGuiCond_Appearing);
+
+    if (ImGui::BeginPopupModal("Update Available", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const std::string latestVersion = statusSnapshot.latestVersion.empty()
+            ? "unknown"
+            : statusSnapshot.latestVersion;
+        const std::string localVersionText = statusSnapshot.localVersion.empty()
+            ? localVersion
+            : statusSnapshot.localVersion;
+        const std::string assetName = statusSnapshot.selectedAsset
+            ? statusSnapshot.selectedAsset->name
+            : "No matching asset";
+        const bool canAutoApply =
+            statusSnapshot.autoApplySupported &&
+            statusSnapshot.selectedAsset.has_value();
+
+        ImGui::TextWrapped("A new version of Spencer Macro Utilities is available.");
+        ImGui::Spacing();
+        ImGui::Text("Current version: %s", localVersionText.c_str());
+        ImGui::Text("Latest version: %s", latestVersion.c_str());
+        ImGui::Text("Package: %s", assetName.c_str());
+        ImGui::Spacing();
+        if (canAutoApply) {
+            ImGui::TextWrapped("Do you want to download and install this update now?");
+        } else {
+#if defined(__linux__)
+            ImGui::TextWrapped(
+                "This Linux installation cannot safely replace itself. Open the official release "
+                "and update with the same AppImage, Debian, RPM, portable, or Nix method you used before.");
+#elif defined(__APPLE__)
+            ImGui::TextWrapped(
+                "This copy cannot safely replace itself. Copy SMU out of the mounted DMG into "
+                "Applications, or install the new release manually.");
+#else
+            ImGui::TextWrapped(
+                "This copy cannot safely replace itself. Open the official release and install "
+                "the update manually.");
+#endif
+        }
+        ImGui::Separator();
+
+        if (isApplying) {
+            ImGui::TextUnformatted("Downloading update...");
+        } else if (canAutoApply) {
+            if (ImGui::Button("Yes", ImVec2(90.0f, 0.0f))) {
+                {
+                    std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+                    g_updateUiState.updateConfirmOpen = false;
+                    g_updateUiState.updatePromptDismissed = true;
+                }
+                ImGui::CloseCurrentPopup();
+                StartApplyUpdateConfirmed();
+            }
+
+            ImGui::SameLine();
+
+            if (ImGui::Button("No", ImVec2(90.0f, 0.0f))) {
+                {
+                    std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+                    g_updateUiState.updateConfirmOpen = false;
+                    g_updateUiState.updatePromptDismissed = true;
+                    g_updateUiState.actionMessage = "Update skipped.";
+                }
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::SameLine();
+
+            if (ImGui::Button("Cancel", ImVec2(90.0f, 0.0f))) {
+                {
+                    std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+                    g_updateUiState.updateConfirmOpen = false;
+                    g_updateUiState.updatePromptDismissed = true;
+                    g_updateUiState.actionMessage = "Update cancelled.";
+                }
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::SetItemDefaultFocus();
+        } else {
+            const bool canOpenRelease =
+                statusSnapshot.latestRelease.has_value() &&
+                !statusSnapshot.latestRelease->htmlUrl.empty() &&
+                static_cast<bool>(context.openExternalUrl);
+            ImGui::BeginDisabled(!canOpenRelease);
+            if (ImGui::Button("Open download page", ImVec2(170.0f, 0.0f))) {
+                context.openExternalUrl(statusSnapshot.latestRelease->htmlUrl.c_str());
+                {
+                    std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+                    g_updateUiState.updateConfirmOpen = false;
+                    g_updateUiState.updatePromptDismissed = true;
+                    g_updateUiState.actionMessage = "Opened the official release page.";
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+
+            if (ImGui::Button("Not now", ImVec2(100.0f, 0.0f))) {
+                {
+                    std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+                    g_updateUiState.updateConfirmOpen = false;
+                    g_updateUiState.updatePromptDismissed = true;
+                    g_updateUiState.actionMessage = "Update skipped.";
+                }
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::SetItemDefaultFocus();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+ImVec4 Brighten(ImVec4 col, float factor)
+{
+    return ImVec4(std::min(col.x * factor, 1.0f),
+        std::min(col.y * factor, 1.0f),
+        std::min(col.z * factor, 1.0f),
+        col.w);
+}
+
+void CopyString(char* destination, std::size_t size, const std::string& source)
+{
+    if (!destination || size == 0) {
+        return;
+    }
+    std::snprintf(destination, size, "%s", source.c_str());
+}
+
+std::string BuildMultiInstanceName(int sectionIndex, int oneBasedIndex)
+{
+    if (sectionIndex >= 0 && sectionIndex < static_cast<int>(sections.size())) {
+        return sections[sectionIndex].title + " " + std::to_string(oneBasedIndex);
+    }
+    return "Instance " + std::to_string(oneBasedIndex);
+}
+
+int GetInstanceRemovalTargetIndex(size_t instanceCount, int selectedIndex)
+{
+    if (instanceCount <= 1) {
+        return -1;
+    }
+    const int lastIndex = static_cast<int>(instanceCount) - 1;
+    if (selectedIndex > 0 && selectedIndex <= lastIndex) {
+        return selectedIndex;
+    }
+    return lastIndex;
+}
+
+int GetCurrentRemovalTargetForSection(int sectionIndex)
+{
+    if (sectionIndex == 5) {
+        return GetInstanceRemovalTargetIndex(presskey_instances.size(), selected_presskey_instance);
+    }
+    if (sectionIndex == 6) {
+        return GetInstanceRemovalTargetIndex(wallhop_instances.size(), selected_wallhop_instance);
+    }
+    if (sectionIndex == 11) {
+        return GetInstanceRemovalTargetIndex(spamkey_instances.size(), selected_spamkey_instance);
+    }
+    return -1;
+}
+
+bool* GetDisableOutsideTogglePtr(int sectionIndex)
+{
+    if (sectionIndex < 0 || sectionIndex >= section_amounts || sectionIndex == 15) {
+        return nullptr;
+    }
+    if (sectionIndex == 5) {
+        if (presskey_instances.empty() || selected_presskey_instance < 0 || selected_presskey_instance >= static_cast<int>(presskey_instances.size())) {
+            return nullptr;
+        }
+        return &presskey_instances[selected_presskey_instance].presskeyinroblox;
+    }
+    if (sectionIndex == 6) {
+        if (wallhop_instances.empty() || selected_wallhop_instance < 0 || selected_wallhop_instance >= static_cast<int>(wallhop_instances.size())) {
+            return nullptr;
+        }
+        return &wallhop_instances[selected_wallhop_instance].disable_outside_roblox;
+    }
+    if (sectionIndex == 11) {
+        if (spamkey_instances.empty() || selected_spamkey_instance < 0 || selected_spamkey_instance >= static_cast<int>(spamkey_instances.size())) {
+            return nullptr;
+        }
+        return &spamkey_instances[selected_spamkey_instance].disable_outside_roblox;
+    }
+    return &disable_outside_roblox[sectionIndex];
+}
+
+void CopyWallhopInstanceData(const WallhopInstance& src, WallhopInstance& dst)
+{
+    dst.wallhop_dx = src.wallhop_dx;
+    dst.wallhop_dy = src.wallhop_dy;
+    dst.wallhop_vertical = src.wallhop_vertical;
+    dst.WallhopDelay = src.WallhopDelay;
+    dst.WallhopBonusDelay = src.WallhopBonusDelay;
+    strncpy_s(dst.WallhopPixels, sizeof(dst.WallhopPixels), src.WallhopPixels, _TRUNCATE);
+    strncpy_s(dst.WallhopVerticalChar, sizeof(dst.WallhopVerticalChar), src.WallhopVerticalChar, _TRUNCATE);
+    strncpy_s(dst.WallhopDelayChar, sizeof(dst.WallhopDelayChar), src.WallhopDelayChar, _TRUNCATE);
+    strncpy_s(dst.WallhopBonusDelayChar, sizeof(dst.WallhopBonusDelayChar), src.WallhopBonusDelayChar, _TRUNCATE);
+    strncpy_s(dst.WallhopDegrees, sizeof(dst.WallhopDegrees), src.WallhopDegrees, _TRUNCATE);
+    dst.wallhopswitch = src.wallhopswitch;
+    dst.toggle_jump = src.toggle_jump;
+    dst.toggle_flick = src.toggle_flick;
+    dst.wallhopcamfix = src.wallhopcamfix;
+    dst.disable_outside_roblox = src.disable_outside_roblox;
+    dst.section_enabled = src.section_enabled;
+    dst.vk_trigger = src.vk_trigger;
+    dst.vk_jumpkey = src.vk_jumpkey;
+    dst.should_exit = false;
+    dst.isRunning = src.isRunning;
+    dst.thread_active.store(src.thread_active.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
+void CopyPresskeyInstanceData(const PresskeyInstance& src, PresskeyInstance& dst)
+{
+    dst.vk_trigger = src.vk_trigger;
+    dst.vk_presskey = src.vk_presskey;
+    dst.PressKeyDelay = src.PressKeyDelay;
+    dst.PressKeyBonusDelay = src.PressKeyBonusDelay;
+    strncpy_s(dst.PressKeyDelayChar, sizeof(dst.PressKeyDelayChar), src.PressKeyDelayChar, _TRUNCATE);
+    strncpy_s(dst.PressKeyBonusDelayChar, sizeof(dst.PressKeyBonusDelayChar), src.PressKeyBonusDelayChar, _TRUNCATE);
+    dst.presskeyinroblox = src.presskeyinroblox;
+    dst.section_enabled = src.section_enabled;
+    dst.should_exit = false;
+    dst.isRunning = src.isRunning;
+    dst.thread_active.store(src.thread_active.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
+void CopySpamkeyInstanceData(const SpamkeyInstance& src, SpamkeyInstance& dst)
+{
+    dst.vk_trigger = src.vk_trigger;
+    dst.vk_spamkey = src.vk_spamkey;
+    dst.spam_delay = src.spam_delay;
+    dst.real_delay = src.real_delay;
+    strncpy_s(dst.SpamDelay, sizeof(dst.SpamDelay), src.SpamDelay, _TRUNCATE);
+    dst.isspamswitch = src.isspamswitch;
+    dst.disable_outside_roblox = src.disable_outside_roblox;
+    dst.section_enabled = src.section_enabled;
+    dst.should_exit = false;
+    dst.isRunning = src.isRunning;
+    dst.thread_active.store(src.thread_active.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
+void FormatHexKeyString(unsigned int combinedCode, char* buffer, size_t size)
+{
+    if (combinedCode == kScriptUnboundHotkey) {
+        CopyString(buffer, size, "UNBOUND");
+        return;
+    }
+    unsigned int vk = combinedCode & HOTKEY_KEY_MASK;
+    std::string hexStr;
+    if (combinedCode & HOTKEY_MASK_WIN) hexStr += "0x5B + ";
+    if (combinedCode & HOTKEY_MASK_CTRL) hexStr += "0x11 + ";
+    if (combinedCode & HOTKEY_MASK_ALT) hexStr += "0x12 + ";
+    if (combinedCode & HOTKEY_MASK_SHIFT) hexStr += "0x10 + ";
+
+    char vkHex[16] = {};
+    std::snprintf(vkHex, sizeof(vkHex), "0x%X", vk);
+    hexStr += vkHex;
+    CopyString(buffer, size, hexStr);
+}
+
+void GetKeyNameFromHex(unsigned int combinedKeyCode, char* buffer, size_t bufferSize)
+{
+    for (auto& [keyPtr, state] : g_bindingStates) {
+        if (state.bindingMode && *keyPtr == combinedKeyCode) {
+            return;
+        }
+    }
+
+    if (combinedKeyCode == kScriptUnboundHotkey) {
+        CopyString(buffer, bufferSize, "UNBOUND");
+        return;
+    }
+
+    unsigned int vk = combinedKeyCode & HOTKEY_KEY_MASK;
+    std::string prefix;
+    if (combinedKeyCode & HOTKEY_MASK_WIN) prefix += "Win + ";
+    if (combinedKeyCode & HOTKEY_MASK_CTRL) prefix += "Ctrl + ";
+    if (combinedKeyCode & HOTKEY_MASK_ALT) prefix += "Alt + ";
+    if (combinedKeyCode & HOTKEY_MASK_SHIFT) prefix += "Shift + ";
+
+    std::string keyName;
+    const std::string_view coreName = smu::core::KeyCodeName(vk);
+    if (!coreName.empty()) {
+        keyName = std::string(coreName);
+    }
+    if (auto backend = smu::platform::GetInputBackend()) {
+        const std::string backendName = backend->formatKeyName(vk);
+        if (!backendName.empty()) {
+            keyName = backendName;
+        }
+    }
+    if (keyName.empty()) {
+        const auto it = vkToString.find(vk);
+        keyName = it != vkToString.end() ? it->second : smu::core::FormatKeyCodeFallback(vk);
+    }
+
+    CopyString(buffer, bufferSize, prefix + keyName);
+}
+
+unsigned int CurrentModifierMask()
+{
+    unsigned int currentModifiers = 0;
+    if (IsKeyPressed(VK_LWIN) || IsKeyPressed(VK_RWIN)) currentModifiers |= HOTKEY_MASK_WIN;
+    if (IsKeyPressed(VK_CONTROL) || IsKeyPressed(VK_LCONTROL) || IsKeyPressed(VK_RCONTROL)) currentModifiers |= HOTKEY_MASK_CTRL;
+    if (IsKeyPressed(VK_MENU) || IsKeyPressed(VK_LMENU) || IsKeyPressed(VK_RMENU)) currentModifiers |= HOTKEY_MASK_ALT;
+    if (IsKeyPressed(VK_SHIFT) || IsKeyPressed(VK_LSHIFT) || IsKeyPressed(VK_RSHIFT)) currentModifiers |= HOTKEY_MASK_SHIFT;
+    return currentModifiers;
+}
+
+unsigned int NormalizeBoundHotkey(unsigned int combinedKey)
+{
+    unsigned int key = combinedKey & HOTKEY_KEY_MASK;
+    unsigned int modifiers = combinedKey & ~HOTKEY_KEY_MASK;
+
+    switch (key) {
+    case VK_SHIFT:
+    case VK_LSHIFT:
+    case VK_RSHIFT:
+        key = VK_SHIFT;
+        modifiers &= ~HOTKEY_MASK_SHIFT;
+        break;
+    case VK_CONTROL:
+    case VK_LCONTROL:
+    case VK_RCONTROL:
+        key = VK_CONTROL;
+        modifiers &= ~HOTKEY_MASK_CTRL;
+        break;
+    case VK_MENU:
+    case VK_LMENU:
+    case VK_RMENU:
+        key = VK_MENU;
+        modifiers &= ~HOTKEY_MASK_ALT;
+        break;
+    case VK_LWIN:
+    case VK_RWIN:
+        modifiers &= ~HOTKEY_MASK_WIN;
+        break;
+    default:
+        break;
+    }
+
+    return (key & HOTKEY_KEY_MASK) | modifiers;
+}
+
+ImVec2 ClampWindowPosToMainViewport(const ImVec2& position, const ImVec2& size)
+{
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImVec2 minPos = viewport->Pos;
+    const ImVec2 maxPos(
+        viewport->Pos.x + std::max(0.0f, viewport->Size.x - size.x),
+        viewport->Pos.y + std::max(0.0f, viewport->Size.y - size.y));
+
+    return ImVec2(
+        std::clamp(position.x, minPos.x, maxPos.x),
+        std::clamp(position.y, minPos.y, maxPos.y));
+}
+
+void ClampCurrentWindowToMainViewport()
+{
+    const ImVec2 currentPos = ImGui::GetWindowPos();
+    const ImVec2 clampedPos = ClampWindowPosToMainViewport(currentPos, ImGui::GetWindowSize());
+    if (clampedPos.x != currentPos.x || clampedPos.y != currentPos.y) {
+        ImGui::SetWindowPos(clampedPos, ImGuiCond_Always);
+    }
+}
+
+unsigned int BindKeyMode(unsigned int* keyVar, unsigned int currentkey, int currentSection)
+{
+    BindingState& state = g_bindingStates[keyVar];
+    RefreshFinishedKeybindSuppression();
+
+    if (state.bindingMode) {
+        g_keybindCaptureActive.store(true, std::memory_order_release);
+        notbinding.store(false, std::memory_order_release);
+        state.rebindTime = std::chrono::steady_clock::now();
+
+        if (state.waitingForReleaseBeforeCapture) {
+            state.buttonText = "Release Keys...";
+            CopyString(state.keyBuffer, sizeof(state.keyBuffer), "Release keys...");
+            CopyString(state.keyBufferHuman, sizeof(state.keyBufferHuman), "Release keys...");
+
+            if (AnyPhysicalKeyOrMouseButtonPressedForBinding()) {
+                return currentkey;
+            }
+
+            state.waitingForReleaseBeforeCapture = false;
+            state.firstRun = false;
+            state.pendingModifierKey = 0;
+            state.pendingModifierCombo = 0;
+            state.keyWasPressed.fill(false);
+            state.buttonText = "Press a Key...";
+        }
+
+        const unsigned int currentModifiers = CurrentModifierMask();
+        if (currentModifiers == 0) {
+            CopyString(state.keyBuffer, sizeof(state.keyBuffer), "Waiting...");
+            CopyString(state.keyBufferHuman, sizeof(state.keyBufferHuman), "Waiting...");
+        } else {
+            char previewHex[64] = {};
+            FormatHexKeyString(currentModifiers, previewHex, sizeof(previewHex));
+            std::string hexStr(previewHex);
+            const std::string suffix = " + 0x0";
+            if (const auto pos = hexStr.find(suffix); pos != std::string::npos) {
+                hexStr = hexStr.substr(0, pos) + " + ...";
+            }
+
+            std::string previewHuman;
+            if (currentModifiers & HOTKEY_MASK_WIN) previewHuman += "Win + ";
+            if (currentModifiers & HOTKEY_MASK_CTRL) previewHuman += "Ctrl + ";
+            if (currentModifiers & HOTKEY_MASK_ALT) previewHuman += "Alt + ";
+            if (currentModifiers & HOTKEY_MASK_SHIFT) previewHuman += "Shift + ";
+            previewHuman += "...";
+
+            CopyString(state.keyBuffer, sizeof(state.keyBuffer), hexStr);
+            CopyString(state.keyBufferHuman, sizeof(state.keyBufferHuman), previewHuman);
+        }
+
+        auto backend = smu::platform::GetInputBackend();
+        if (!backend) {
+            return currentkey;
+        }
+
+        if (const auto transientInput = backend->consumeNextTransientInput()) {
+            const unsigned int finalCombo = NormalizeBoundHotkey(
+                (*transientInput & HOTKEY_KEY_MASK) | currentModifiers);
+
+            state.bindingMode = false;
+            state.waitingForReleaseBeforeCapture = false;
+            state.firstRun = true;
+            state.pendingModifierKey = 0;
+            state.pendingModifierCombo = 0;
+
+            GetKeyNameFromHex(finalCombo, state.keyBufferHuman, sizeof(state.keyBufferHuman));
+            FormatHexKeyString(finalCombo, state.keyBuffer, sizeof(state.keyBuffer));
+            state.buttonText = "Click to Bind Key";
+
+            FinishKeybindCapture();
+            return finalCombo;
+        }
+
+        for (int key = 1; key < static_cast<int>(state.keyWasPressed.size()); ++key) {
+            const bool currentlyPressed = IsKeyPressed(static_cast<smu::core::KeyCode>(key));
+            const bool wasPressed = state.keyWasPressed[key];
+            state.keyWasPressed[key] = currentlyPressed;
+
+            if (!currentlyPressed || wasPressed) {
+                continue;
+            }
+
+            if (smu::core::IsModifierKey(key)) {
+                state.pendingModifierKey = static_cast<unsigned int>(key);
+                state.pendingModifierCombo = currentModifiers;
+                continue;
+            }
+
+            const unsigned int finalCombo =
+                NormalizeBoundHotkey((static_cast<unsigned int>(key) & HOTKEY_KEY_MASK) | currentModifiers);
+
+            state.bindingMode = false;
+            state.waitingForReleaseBeforeCapture = false;
+            state.firstRun = true;
+            state.pendingModifierKey = 0;
+            state.pendingModifierCombo = 0;
+
+            GetKeyNameFromHex(finalCombo, state.keyBufferHuman, sizeof(state.keyBufferHuman));
+            FormatHexKeyString(finalCombo, state.keyBuffer, sizeof(state.keyBuffer));
+            state.buttonText = "Click to Bind Key";
+
+            FinishKeybindCapture();
+            return finalCombo;
+        }
+
+        if (state.pendingModifierKey != 0 &&
+            !IsKeyPressed(static_cast<smu::core::KeyCode>(state.pendingModifierKey)) &&
+            currentModifiers == 0) {
+            const unsigned int finalCombo = NormalizeBoundHotkey(
+                (state.pendingModifierKey & HOTKEY_KEY_MASK) | state.pendingModifierCombo);
+
+            state.bindingMode = false;
+            state.waitingForReleaseBeforeCapture = false;
+            state.firstRun = true;
+            state.pendingModifierKey = 0;
+            state.pendingModifierCombo = 0;
+
+            GetKeyNameFromHex(finalCombo, state.keyBufferHuman, sizeof(state.keyBufferHuman));
+            FormatHexKeyString(finalCombo, state.keyBuffer, sizeof(state.keyBuffer));
+            state.buttonText = "Click to Bind Key";
+
+            FinishKeybindCapture();
+            return finalCombo;
+        }
+
+        return currentkey;
+    }
+
+    state.firstRun = true;
+    if (currentSection != state.lastSelectedSection || currentSection == -1) {
+        FormatHexKeyString(currentkey, state.keyBuffer, sizeof(state.keyBuffer));
+        GetKeyNameFromHex(currentkey, state.keyBufferHuman, sizeof(state.keyBufferHuman));
+        if (currentSection != -1) {
+            state.lastSelectedSection = currentSection;
+        }
+    }
+
+    state.buttonText = "Click to Bind Key";
+    auto currentTime = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsedtime = currentTime - state.rebindTime;
+    if (!g_keybindCaptureActive.load(std::memory_order_acquire) &&
+        !g_suppressHotkeysUntilRelease.load(std::memory_order_acquire) &&
+        elapsedtime.count() >= 0.3) {
+        state.notBinding = true;
+        notbinding.store(true, std::memory_order_release);
+    }
+
+    return currentkey;
+}
+
+void DrawKeyBindControl(
+    const char* id,
+    unsigned int& key,
+    int currentSection,
+    float humanWidth = 170.0f,
+    float hexWidth = 130.0f,
+    bool wrapKeyBindingLabel = false)
+{
+    ImGui::PushID(id);
+    BindingState& state = g_bindingStates[&key];
+
+    if (ImGui::Button(state.buttonText.c_str())) {
+        StartKeybindCapture(state);
+    }
+
+    ImGui::SameLine();
+    key = BindKeyMode(&key, key, currentSection);
+
+    ImGui::SetNextItemWidth(humanWidth);
+    GetKeyNameFromHex(key, state.keyBufferHuman, sizeof(state.keyBufferHuman));
+    ImGui::InputText("##KeyHuman", state.keyBufferHuman, sizeof(state.keyBufferHuman), ImGuiInputTextFlags_ReadOnly);
+
+    if (wrapKeyBindingLabel) {
+    } else {
+        ImGui::SameLine();
+    }
+    ImGui::TextWrapped("Key Binding");
+
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(hexWidth);
+    ImGui::InputText("##KeyHex", state.keyBuffer, sizeof(state.keyBuffer), ImGuiInputTextFlags_CharsNoBlank | ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_ReadOnly);
+
+    ImGui::SameLine();
+    ImGui::TextWrapped("(Hex)");
+    ImGui::PopID();
+}
+
+void BeginModalInputCapture()
+{
+    g_keybindCaptureActive.store(true, std::memory_order_release);
+    g_suppressHotkeysUntilRelease.store(true, std::memory_order_release);
+    notbinding.store(false, std::memory_order_release);
+}
+
+void EndModalInputCapture()
+{
+    g_keybindCaptureActive.store(false, std::memory_order_release);
+    g_suppressHotkeysUntilRelease.store(true, std::memory_order_release);
+    notbinding.store(false, std::memory_order_release);
+}
+
+void QueueScriptImportTrustModal(const std::filesystem::path& path)
+{
+    g_pending_import_path = path;
+    g_import_preview = LoadImportPreview(path);
+    g_open_import_trust_modal = true;
+    g_import_error.clear();
+}
+
+bool IsValidDroppedScriptFile(const std::filesystem::path& path)
+{
+    if (!IsSupportedScriptExtension(path)) {
+        return false;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) {
+        return false;
+    }
+    if (!std::filesystem::is_regular_file(path, ec) || ec) {
+        return false;
+    }
+    return true;
+}
+
+void OpenScriptFileDialogFallback()
+{
+    BeginModalInputCapture();
+    g_script_file_dialog_open = true;
+    IGFD::FileDialogConfig config;
+    config.path = ".";
+    ImGuiFileDialog::Instance()->OpenDialog(
+        "SMUImportScriptFileDialog",
+        "Import SMU Script",
+        "SMU Scripts{.txt,.lua,.hss,.smus}",
+        config);
+}
+
+void StartImportedScriptImportFlow()
+{
+    smu::platform::FileDialogOptions options;
+    options.title = "Import SMU Script";
+    options.extensions = {".smus", ".hss", ".lua", ".txt"};
+
+    BeginModalInputCapture();
+    const smu::platform::FileDialogResult result = smu::platform::OpenNativeFileDialog(options);
+    EndModalInputCapture();
+
+    if (result.type == smu::platform::FileDialogResultType::Selected) {
+        QueueScriptImportTrustModal(result.path);
+    } else if (result.type == smu::platform::FileDialogResultType::Unavailable) {
+        OpenScriptFileDialogFallback();
+    } else if (result.type == smu::platform::FileDialogResultType::Error) {
+        g_import_error = result.error.empty() ? "File picker failed." : result.error;
+    }
+}
+
+void RenderScriptFileDialogFallback()
+{
+    if (!g_script_file_dialog_open) {
+        return;
+    }
+
+    const ImVec2 viewportSize = ImGui::GetMainViewport()->Size;
+    const ImVec2 minSize(std::max(320.0f, viewportSize.x * 0.5f), std::max(240.0f, viewportSize.y * 0.5f));
+    if (ImGuiFileDialog::Instance()->Display("SMUImportScriptFileDialog", ImGuiWindowFlags_NoCollapse, minSize)) {
+        if (ImGuiFileDialog::Instance()->IsOk()) {
+            QueueScriptImportTrustModal(ImGuiFileDialog::Instance()->GetFilePathName());
+        }
+
+        ImGuiFileDialog::Instance()->Close();
+        g_script_file_dialog_open = false;
+        EndModalInputCapture();
+    }
+}
+
+void RenderImportTrustModal()
+{
+    if (g_open_import_trust_modal) {
+        ImGui::OpenPopup("Import Script?");
+        g_open_import_trust_modal = false;
+    }
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImVec2 center = viewport->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    const ImVec2 initialSize(
+        std::min(760.0f, viewport->Size.x * 0.92f),
+        std::min(560.0f, viewport->Size.y * 0.88f));
+    const ImVec2 minSize(560.0f, 420.0f);
+    const ImVec2 maxSize(viewport->Size.x * 0.96f, viewport->Size.y * 0.94f);
+    ImGui::SetNextWindowSizeConstraints(minSize, maxSize);
+    ImGui::SetNextWindowSize(initialSize, ImGuiCond_Appearing);
+
+    if (ImGui::BeginPopupModal("Import Script?", nullptr)) {
+        ImGui::TextWrapped("Imported scripts can control keyboard and mouse input and interact with Roblox-related SMU features. Only import scripts from people you trust.");
+        ImGui::Spacing();
+        if (g_pending_import_path) {
+            const std::string displayPath = SanitizePathForDisplay(*g_pending_import_path);
+            ImGui::TextWrapped("File: %s", displayPath.c_str());
+        }
+        ImGui::Separator();
+
+        if (ImGui::Button("Import", ImVec2(90.0f, 0.0f))) {
+            if (g_pending_import_path) {
+                const std::size_t beforeCount = ScriptManager::Get().count();
+                const ScriptImportResult importResult = ScriptManager::Get().importScriptWithResult(*g_pending_import_path);
+                const bool ok = importResult == ScriptImportResult::Success;
+                const std::size_t afterCount = ScriptManager::Get().count();
+                if (afterCount > beforeCount) {
+                    g_selected_imported_script = static_cast<int>(afterCount - 1);
+                    selected_section = -1;
+                    auto record = ScriptManager::Get().get(afterCount - 1);
+                    const std::string lastError = record ? record->lastErrorCopy() : std::string();
+                    if (!ok && !lastError.empty()) {
+                        g_import_error = lastError;
+                    } else {
+                        g_import_error.clear();
+                    }
+                    if (ok && !smu::app::SaveSharedProfilesNow()) {
+                        g_import_error = "Script imported, but the settings file could not be updated.";
+                    }
+                } else if (!ok) {
+                    if (importResult == ScriptImportResult::AlreadyImported) {
+                        g_import_error = "Script is already imported.";
+                    } else {
+                        g_import_error = "Script could not be imported because it is malformed or invalid.";
+                    }
+                }
+            }
+            g_pending_import_path.reset();
+            ClearImportPreview();
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(90.0f, 0.0f))) {
+            g_pending_import_path.reset();
+            ClearImportPreview();
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::Spacing();
+        ImGui::SeparatorText("Preview");
+        ImGui::TextDisabled("Read-only source preview. If the script is malicious, it's your fault.");
+        RenderImportPreview(g_import_preview);
+
+        ImGui::EndPopup();
+    }
+}
+
+smu::platform::LagSwitchConfig BuildLagSwitchConfigFromUiState()
+{
+    smu::platform::LagSwitchConfig config;
+    config.enabled = bWinDivertEnabled;
+    config.currentlyBlocking = g_windivert_blocking.load(std::memory_order_relaxed);
+    config.inboundHardBlock = lagswitchinbound;
+    config.outboundHardBlock = lagswitchoutbound;
+#if defined(_WIN32) || defined(__linux__)
+    config.fakeLagEnabled = lagswitchlag;
+#else
+    config.fakeLagEnabled = false;
+#endif
+    config.inboundFakeLag = lagswitchlaginbound;
+    config.outboundFakeLag = lagswitchlagoutbound;
+    config.fakeLagDelayMs = lagswitchlagdelay;
+    config.targetRobloxOnly = lagswitchtargetroblox;
+    config.targetMode = lagswitchtargetroblox ? smu::platform::LagSwitchTargetMode::Roblox : smu::platform::LagSwitchTargetMode::All;
+    config.useUdp = true;
+    config.useTcp = lagswitchusetcp;
+#if defined(_WIN32)
+    config.preventDisconnect = prevent_disconnect;
+#else
+    config.preventDisconnect = false;
+#endif
+    config.autoUnblock = lagswitch_autounblock;
+    config.maxDurationSeconds = lagswitch_max_duration;
+    config.unblockDurationMs = lagswitch_unblock_ms;
+    return config;
+}
+
+void SyncLagSwitchBackendConfig()
+{
+    if (auto backend = smu::platform::GetNetworkLagBackend()) {
+        backend->setConfig(BuildLagSwitchConfigFromUiState());
+        g_windivert_blocking.store(backend->isBlockingActive(), std::memory_order_relaxed);
+    }
+}
+
+bool InitializeLagSwitchBackend(std::string* errorMessage = nullptr)
+{
+    SyncLagSwitchBackendConfig();
+    if (auto backend = smu::platform::GetNetworkLagBackend()) {
+        const bool ok = backend->init(errorMessage);
+        bWinDivertEnabled = ok;
+        return ok;
+    }
+    if (errorMessage) {
+        *errorMessage = "Network lagswitch backend is unavailable.";
+    }
+    bWinDivertEnabled = false;
+    return false;
+}
+
+void ShutdownLagSwitchBackend()
+{
+    if (auto backend = smu::platform::GetNetworkLagBackend()) {
+        backend->shutdown();
+    }
+    bWinDivertEnabled = false;
+    g_windivert_blocking.store(false, std::memory_order_relaxed);
+}
+
+std::string FileUrlFromPath(const std::string& path)
+{
+    if (path.empty()) {
+        return {};
+    }
+
+    std::string url = "file://";
+    for (char ch : path) {
+        if (ch == ' ') {
+            url += "%20";
+        } else {
+            url += ch;
+        }
+    }
+    return url;
+}
+
+void RenderLinuxInputSetup(AppContext& context)
+{
+#if defined(__linux__)
+    if (!context.linuxInputSetupRequired) {
+        return;
+    }
+
+    ImGui::OpenPopup("Linux Input Setup Required");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(620.0f, 0.0f), ImGuiCond_Appearing);
+
+    if (ImGui::BeginPopupModal("Linux Input Setup Required", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("Native Linux input requires access to /dev/input/event* and /dev/uinput.");
+        ImGui::TextWrapped(
+            "SMU can install a one-time udev rule and add your user to the smu-input group. "
+            "The graphical installer uses your desktop polkit agent. If no authentication window appears, "
+            "use the terminal installer or copy the manual sudo command.");
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", context.linuxInputPermissionSummary.c_str());
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 580.0f);
+        ImGui::TextUnformatted(context.linuxInputPermissionDetails.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::Separator();
+
+        if (ImGui::Button("Install permissions")) {
+            if (context.installLinuxPermissionsGraphical) {
+                context.installLinuxPermissionsGraphical();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Open terminal installer")) {
+            if (context.installLinuxPermissionsTerminal) {
+                context.installLinuxPermissionsTerminal();
+            }
+        }
+
+        if (ImGui::Button("Copy manual sudo command")) {
+            if (!context.linuxInputSudoCommand.empty() && SDL_SetClipboardText(context.linuxInputSudoCommand.c_str())) {
+                context.linuxInputSetupActionMessage = "Copied: " + context.linuxInputSudoCommand;
+            } else {
+                context.linuxInputSetupActionMessage = "Could not copy the sudo command to the clipboard.";
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Open setup docs")) {
+            if (context.openExternalUrl) {
+                const std::string docsUrl = FileUrlFromPath(context.linuxInputSetupDocsPath);
+                if (!docsUrl.empty()) {
+                    context.openExternalUrl(docsUrl.c_str());
+                }
+            }
+        }
+
+        if (ImGui::Button("Retry permission check")) {
+            if (context.refreshLinuxInputPermissions) {
+                context.refreshLinuxInputPermissions();
+            }
+        }
+
+        if (!context.linuxInputSetupActionMessage.empty()) {
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 580.0f);
+            ImGui::TextUnformatted(context.linuxInputSetupActionMessage.c_str());
+            ImGui::PopTextWrapPos();
+        }
+
+        if (!context.linuxInputSetupRequired) {
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+#else
+    (void)context;
+#endif
+}
+
+void RenderWaylandScreenCapturePrompt(AppContext& context)
+{
+#if defined(__linux__)
+    if (!context.linuxWaylandScreenCapturePromptPending) {
+        return;
+    }
+
+    ImGui::OpenPopup("Enable Wayland Screen Capture?");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 0.0f), ImGuiCond_Appearing);
+
+    bool keepOpen = true;
+    if (ImGui::BeginPopupModal("Enable Wayland Screen Capture?", &keepOpen, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "A running Lua script called getPixelColor() or getPixelRect(). On Wayland, SMU must ask the desktop "
+            "portal for permission to capture one monitor.");
+        ImGui::TextWrapped(
+            "Enable will open your desktop's monitor picker. The script stays paused until a monitor is selected "
+            "and the first frame is ready.");
+        ImGui::Separator();
+        if (ImGui::Button("Enable and Select Monitor")) {
+            if (context.approveLinuxWaylandScreenCapturePrompt) {
+                context.approveLinuxWaylandScreenCapturePrompt();
+            }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Don't Enable")) {
+            if (context.declineLinuxWaylandScreenCapturePrompt) {
+                context.declineLinuxWaylandScreenCapturePrompt();
+            }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (!keepOpen && context.declineLinuxWaylandScreenCapturePrompt) {
+        context.declineLinuxWaylandScreenCapturePrompt();
+    }
+#else
+    (void)context;
+#endif
+}
+
+void RenderWaylandRemoteDesktopPrompt(AppContext& context)
+{
+#if defined(__linux__)
+    if (!context.linuxWaylandRemoteDesktopPromptPending) {
+        return;
+    }
+
+    ImGui::OpenPopup("Enable Wayland Absolute Mouse Control?");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(590.0f, 0.0f), ImGuiCond_Appearing);
+
+    bool keepOpen = true;
+    if (ImGui::BeginPopupModal("Enable Wayland Absolute Mouse Control?", &keepOpen, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "A running Lua script called moveMouseAbs(). On Wayland, SMU needs explicit permission to control "
+            "the pointer and capture one monitor through the desktop portal.");
+        ImGui::TextWrapped(
+            "Enable opens your desktop's permission dialog. The script remains paused until pointer control and "
+            "the selected monitor's first frame are ready. This does not let SMU read the current global cursor position.");
+        ImGui::Separator();
+        if (ImGui::Button("Enable Pointer Control and Select Monitor")) {
+            if (context.approveLinuxWaylandRemoteDesktopPrompt) {
+                context.approveLinuxWaylandRemoteDesktopPrompt();
+            }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Don't Enable")) {
+            if (context.declineLinuxWaylandRemoteDesktopPrompt) {
+                context.declineLinuxWaylandRemoteDesktopPrompt();
+            }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (!keepOpen && context.declineLinuxWaylandRemoteDesktopPrompt) {
+        context.declineLinuxWaylandRemoteDesktopPrompt();
+    }
+#else
+    (void)context;
+#endif
+}
+
+void RenderMacOSPermissionSetup(AppContext& context)
+{
+#if defined(__APPLE__)
+    if (!context.platformSetupRequired) {
+        context.platformSetupDismissed = false;
+        return;
+    }
+    if (context.platformSetupDismissed) {
+        return;
+    }
+
+    const char* title = context.platformSetupTitle.empty()
+        ? "macOS Permissions Required"
+        : context.platformSetupTitle.c_str();
+    ImGui::OpenPopup(title);
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(640.0f, 0.0f), ImGuiCond_Appearing);
+
+    if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "macOS requires Accessibility for macro input and Screen Recording for pixel reads.");
+        if (!context.platformSetupSummary.empty()) {
+            ImGui::TextWrapped("%s", context.platformSetupSummary.c_str());
+        }
+        ImGui::TextWrapped(
+            "After changing a Privacy & Security setting, restart SMU so macOS reports the new state.");
+        ImGui::Separator();
+
+        ImGui::Text("Accessibility: %s",
+            context.platformAccessibilityPermissionGranted ? "Granted" : "Missing");
+        ImGui::Text("Screen Recording for pixel reads: %s",
+            context.platformScreenRecordingPermissionGranted ? "Granted" : "Missing");
+
+        if (!context.platformSetupDetails.empty()) {
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 600.0f);
+            ImGui::TextUnformatted(context.platformSetupDetails.c_str());
+            ImGui::PopTextWrapPos();
+        }
+
+        ImGui::Separator();
+        if (!context.platformAccessibilityPermissionGranted &&
+            ImGui::Button("Open Accessibility Settings")) {
+            if (context.requestAccessibilityPermission) {
+                context.requestAccessibilityPermission();
+            }
+        }
+
+        if (!context.platformScreenRecordingPermissionGranted) {
+            const char* screenRecordingLabel = "Request Screen Recording Permission";
+            if (!context.platformAccessibilityPermissionGranted) {
+                const float spacing = ImGui::GetStyle().ItemSpacing.x;
+                const float nextButtonWidth =
+                    ImGui::CalcTextSize(screenRecordingLabel).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+                if (ImGui::GetContentRegionAvail().x >= spacing + nextButtonWidth) {
+                    ImGui::SameLine();
+                }
+            }
+            if (ImGui::Button(screenRecordingLabel)) {
+                if (context.requestScreenRecordingPermission) {
+                    context.requestScreenRecordingPermission();
+                }
+            }
+        }
+
+        if (context.resetMacOSPermissionEntries) {
+            if (ImGui::Button("Reset macOS Permission Entries")) {
+                context.resetMacOSPermissionEntries();
+            }
+        }
+
+        if (ImGui::Button("Restart & Check Permissions")) {
+            if (context.restartApplication && !context.restartApplication()) {
+                context.platformSetupActionMessage =
+                    "Could not restart SMU automatically. Quit and reopen the app.";
+            }
+        }
+
+        if (!context.platformSetupActionMessage.empty()) {
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 600.0f);
+            ImGui::TextUnformatted(context.platformSetupActionMessage.c_str());
+            ImGui::PopTextWrapPos();
+        }
+
+        if (!context.platformSetupRequired) {
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+#else
+    (void)context;
+#endif
+}
+
+void RenderAdministratorRequiredPopup()
+{
+#if defined(_WIN32) || defined(__linux__)
+    if (bShowAdminPopup) {
+        ImGui::OpenPopup("Administrator Required");
+    }
+
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    // Keep this centered even if the popup is reopened across frames.
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    // Avoid a one-frame full-height stretch by constraining size before the first Begin.
+    ImGui::SetNextWindowSizeConstraints(ImVec2(520.0f, 0.0f), ImVec2(720.0f, 1000.0f));
+
+    if (ImGui::BeginPopupModal("Administrator Required", &bShowAdminPopup, ImGuiWindowFlags_AlwaysAutoResize)) {
+#if defined(_WIN32)
+        ImGui::TextWrapped("WinDivert features require Administrator privileges.");
+        ImGui::TextWrapped("This process involves:");
+        ImGui::BulletText("Extracting SMCWinDivert.dll and WinDivert64.sys to the current folder.");
+        ImGui::BulletText("Restarting this application as Administrator.");
+#elif defined(__linux__)
+        ImGui::TextWrapped("Linux lagswitch features require a privileged nethelper process.");
+        ImGui::TextWrapped("This process involves:");
+        ImGui::BulletText("Starting the bundled nethelper with pkexec.");
+        ImGui::BulletText("Keeping the SMU GUI running as your normal desktop user.");
+#endif
+        ImGui::Separator();
+
+        ImGui::Checkbox("Do not show this again", &DontShowAdminWarning);
+
+        ImGui::Separator();
+#if defined(_WIN32)
+        if (ImGui::Button("Restart as Admin", ImVec2(180, 0))) {
+            ImGui::CloseCurrentPopup();
+            bShowAdminPopup = false;
+            smu::app::SaveSharedProfilesNow();
+            if (smu::platform::windows::RestartAsAdmin()) {
+                done.store(true, std::memory_order_release);
+                running.store(false, std::memory_order_release);
+                auto& appState = smu::core::GetAppState();
+                appState.done.store(true, std::memory_order_release);
+                appState.running.store(false, std::memory_order_release);
+            }
+        }
+#elif defined(__linux__)
+        if (ImGui::Button("Start Helper", ImVec2(180, 0))) {
+            smu::app::SaveSharedProfilesNow();
+            std::string helperError;
+            if (!smu::app::StartLinuxNetworkHelperWithGraphicalPkexec(&helperError)) {
+                if (!helperError.empty()) {
+                    LogWarning(helperError);
+                }
+            } else {
+                std::string backendError;
+                if (!InitializeLagSwitchBackend(&backendError) && !backendError.empty()) {
+                    LogWarning(backendError);
+                }
+            }
+            ImGui::CloseCurrentPopup();
+            bShowAdminPopup = false;
+        }
+#endif
+        ImGui::SetItemDefaultFocus();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+            bShowAdminPopup = false;
+        }
+
+        ImGui::EndPopup();
+    }
+#else
+    (void)0;
+#endif
+}
+
+void RestartLagSwitchCapture()
+{
+    SyncLagSwitchBackendConfig();
+    if (auto backend = smu::platform::GetNetworkLagBackend()) {
+        backend->restartCapture();
+    }
+}
+
+void RefreshProcessStatus(AppContext& context)
+{
+    static double nextRefreshTime = 0.0;
+    const double now = ImGui::GetTime();
+    if (now < nextRefreshTime) {
+        return;
+    }
+    nextRefreshTime = now + 1.0;
+
+    auto backend = smu::platform::GetProcessBackend();
+    if (!backend) {
+        processFound = false;
+        context.detectedProcessCount = 0;
+        return;
+    }
+
+    const auto pids = backend->findAllProcesses(settingsBuffer);
+    context.detectedProcessCount = pids.size();
+    processFound = !pids.empty();
+}
+
+void RenderUpdaterPanel(AppContext& context)
+{
+    StartUpdateCheck(false);
+
+    smu::updater::UpdaterStatus status;
+    bool checking = false;
+    bool applying = false;
+    bool checkedOnce = false;
+    std::string actionMessage;
+    {
+        std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+        status = g_updateUiState.status;
+        checking = g_updateUiState.checking;
+        applying = g_updateUiState.applying;
+        checkedOnce = g_updateUiState.checkedOnce;
+        actionMessage = g_updateUiState.actionMessage;
+    }
+
+    UserOutdated = checkedOnce && status.updateAvailable;
+
+    if (!ImGui::CollapsingHeader("Updates", ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+
+    ImGui::Text("Local version: %s", localVersion.c_str());
+    if (checkedOnce && !status.latestVersion.empty()) {
+        ImGui::Text("Latest version: %s", status.latestVersion.c_str());
+    } else {
+        ImGui::TextUnformatted("Latest version: unknown");
+    }
+
+    if (checking) {
+        ImGui::TextUnformatted("Status: checking...");
+    } else if (checkedOnce) {
+        ImGui::TextWrapped("Status: %s", status.message.c_str());
+    } else {
+        ImGui::TextUnformatted("Status: not checked yet");
+    }
+
+    if (status.selectedAsset) {
+        ImGui::TextWrapped("Selected package: %s", status.selectedAsset->name.c_str());
+    }
+
+    if (ImGui::Button("Check for updates")) {
+        StartUpdateCheck(true);
+    }
+
+    const bool canApply = checkedOnce &&
+        status.updateAvailable &&
+        status.autoApplySupported &&
+        status.latestRelease.has_value() &&
+        status.selectedAsset.has_value() &&
+        !checking &&
+        !applying;
+
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!canApply);
+    if (ImGui::Button(applying ? "Applying update..." : "Download and install update")) {
+        StartApplyUpdate();
+    }
+    ImGui::EndDisabled();
+
+    if (checkedOnce && status.updateAvailable && !status.autoApplySupported) {
+#if defined(__linux__)
+        ImGui::TextColored(GetCurrentTheme().warning_color,
+            "This Linux package cannot replace itself. Download the release and reinstall it "
+            "with the same AppImage, Debian, RPM, portable, or Nix method you used before.");
+#elif defined(__APPLE__)
+        ImGui::TextColored(GetCurrentTheme().warning_color,
+            "This copy cannot replace itself. Install SMU in a writable folder such as "
+            "Applications, or download and install the release manually.");
+#else
+        ImGui::TextColored(GetCurrentTheme().warning_color,
+            "Update check available; automatic installation is unavailable in this launch mode.");
+#endif
+    }
+
+    const bool canOpenRelease = checkedOnce &&
+        status.updateAvailable &&
+        status.latestRelease.has_value() &&
+        !status.latestRelease->htmlUrl.empty() &&
+        static_cast<bool>(context.openExternalUrl);
+    if (canOpenRelease) {
+        if (ImGui::Button("Open release download page")) {
+            context.openExternalUrl(status.latestRelease->htmlUrl.c_str());
+        }
+    }
+
+    if (!actionMessage.empty()) {
+        ImGui::TextWrapped("%s", actionMessage.c_str());
+    }
+
+    ImGui::Separator();
+}
+
+void RenderSettingsMenu(AppContext& context, bool* open)
+{
+    if (!*open) {
+        g_hasStoredSettingsWindowPos = false;
+        return;
+    }
+
+    ImVec2 mainWindowSize = ImGui::GetIO().DisplaySize;
+    float childWidth = mainWindowSize.x * 0.5f;
+    float childHeight = mainWindowSize.y * 0.5f;
+    ImVec2 childPos((mainWindowSize.x * 0.4f), (mainWindowSize.y - childHeight - 90) * 0.5f);
+
+    const ImVec2 requestedPos = g_hasStoredSettingsWindowPos ? g_storedSettingsWindowPos : childPos;
+    ImGui::SetNextWindowPos(ClampWindowPosToMainViewport(requestedPos, ImVec2(childWidth, childHeight)), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(childWidth, childHeight), ImGuiCond_Always);
+
+    if (ImGui::Begin("Settings Menu", open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+        ClampCurrentWindowToMainViewport();
+        g_storedSettingsWindowPos = ClampWindowPosToMainViewport(ImGui::GetWindowPos(), ImGui::GetWindowSize());
+        g_hasStoredSettingsWindowPos = true;
+        ImGui::BeginChild("SettingsList", ImVec2(0, 0), true);
+
+        RenderUpdaterPanel(context);
+
+#if defined(__linux__)
+        if (context.refreshLinuxWaylandScreenCapture) {
+            context.refreshLinuxWaylandScreenCapture();
+        }
+        if (context.capabilities.displayServer == "wayland") {
+            ImGui::TextUnformatted("Wayland Screen Capture");
+            ImGui::TextWrapped(
+                "Pixel scripts need explicit permission to capture one monitor. "
+                "The selected monitor becomes the coordinate space for getPixelColor() and getPixelRect() while capture is active.");
+            if (!context.linuxWaylandScreenCaptureSupported) {
+                ImGui::TextColored(GetCurrentTheme().error_color,
+                    "This build does not include PipeWire ScreenCast support.");
+            } else if (context.linuxWaylandScreenCaptureActive) {
+                ImGui::TextColored(GetCurrentTheme().success_color, "Status: %s",
+                    context.linuxWaylandScreenCaptureStatus.c_str());
+                if (ImGui::Button("Stop Wayland Screen Capture")) {
+                    if (context.stopLinuxWaylandScreenCapture) {
+                        context.stopLinuxWaylandScreenCapture();
+                    }
+                }
+            } else {
+                ImGui::TextWrapped("Status: %s", context.linuxWaylandScreenCaptureStatus.c_str());
+                if (ImGui::Button("Enable Wayland Screen Capture")) {
+                    if (context.startLinuxWaylandScreenCapture) {
+                        context.startLinuxWaylandScreenCapture();
+                    }
+                }
+            }
+            ImGui::Separator();
+
+            ImGui::TextUnformatted("Wayland Absolute Mouse Control");
+            ImGui::TextWrapped(
+                "Allow moveMouseAbs() to place the pointer on the selected monitor. This replaces a screen-capture-only "
+                "session with a RemoteDesktop + ScreenCast session and needs separate pointer-control permission.");
+            if (context.linuxWaylandRemoteDesktopActive) {
+                ImGui::TextColored(GetCurrentTheme().success_color, "Status: %s",
+                    context.linuxWaylandRemoteDesktopStatus.c_str());
+            } else {
+                ImGui::TextWrapped("Status: %s", context.linuxWaylandRemoteDesktopStatus.c_str());
+                if (ImGui::Button("Enable Wayland Absolute Mouse Control")) {
+                    if (context.startLinuxWaylandRemoteDesktop) {
+                        context.startLinuxWaylandRemoteDesktop();
+                    }
+                }
+            }
+            ImGui::Separator();
+        }
+#endif
+
+        ImGui::TextUnformatted("Your Current Windows Display Scale Value (10-500%):");
+        ImGui::SetNextItemWidth(150);
+        if (ImGui::InputInt("##DisplayScale", &display_scale)) {
+            display_scale = std::clamp(display_scale, 10, 500);
+        }
+        ImGui::SameLine();
+        ImGui::Text("%%");
+        ImGui::Separator();
+
+        ImGui::TextWrapped("Custom Shiftlock Key:");
+        DrawKeyBindControl("ShiftKey", vk_shiftkey, selected_section, 150.0f, 50.0f, true);
+        ImGui::Separator();
+
+        ImGui::Checkbox("Force-Set Chat Open Key to \"/\" (Most Stable)", &chatoverride);
+        ImGui::Separator();
+
+        ImGui::TextWrapped("Custom Chat Key (Must disable Force-Set):");
+        DrawKeyBindControl("ChatKey", vk_chatkey, selected_section, 150.0f, 50.0f, true);
+        ImGui::Separator();
+
+        ImGui::Checkbox("##Oldpaste", &useoldpaste);
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() - 4);
+        ImGui::TextWrapped("Old Unicode Chat-Typing (Works across languages but may be blocked by some anticheats)");
+        ImGui::Separator();
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextWrapped("Delay between every key press in chat (ms):");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(30.0f);
+        if (ImGui::InputText("##PasteDelay", PasteDelayChar, sizeof(PasteDelayChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            try { PasteDelay = std::stoi(PasteDelayChar); } catch (...) {}
+        }
+        ImGui::Separator();
+
+        ImGui::TextWrapped("Custom Anti-AFK Key (That the macro uses):");
+        DrawKeyBindControl("AfkKey", vk_afkkey, selected_section, 150.0f, 50.0f, true);
+        ImGui::Separator();
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("Amount of Minutes Between Anti-AFK Runs:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(30.0f);
+        if (ImGui::InputText("##AntiAFKTime", AntiAFKTimeChar, sizeof(AntiAFKTimeChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            try { AntiAFKTime = std::stoi(AntiAFKTimeChar); } catch (...) {}
+        }
+        ImGui::Separator();
+
+        ImGui::Checkbox("Replace shiftlock with zooming in", &globalzoomin);
+        ImGui::SameLine();
+        ImGui::Checkbox("Reverse Direction?", &globalzoominreverse);
+        ImGui::Separator();
+        ImGui::Checkbox("Double-Press AFK keybind during Anti-AFK", &doublepressafkkey);
+        ImGui::Separator();
+
+        if (ImGui::Checkbox("Remove Side-Bar Macro Descriptions", &shortdescriptions)) {
+            InitializeSections();
+        }
+        ImGui::Separator();
+
+        ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight() * 0.5f));
+        ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().accent_primary);
+        ImGui::Text("%s", "Want to Donate directly to my Github?");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsItemClicked() && context.openExternalUrl) {
+                context.openExternalUrl("https://github.com/sponsors/Spencer0187");
+            }
+        }
+        ImGui::PopStyleColor();
+        ImGui::Text("%s", "Github Doesn't take any of the profits.");
+
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
+void ResetFloatingUiWindowStateInternal()
+{
+    g_hasStoredSettingsWindowPos = false;
+    g_storedSettingsWindowPos = ImVec2();
+}
+
+void RenderGlobalSettings(AppContext& context, ImVec2 displaySize)
+{
+    StartUpdateCheck(false);
+    {
+        std::lock_guard<std::mutex> lock(g_updateUiState.mutex);
+        if (g_updateUiState.checkedOnce) {
+            UserOutdated = g_updateUiState.status.updateAvailable;
+        }
+    }
+    RefreshProcessStatus(context);
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextWrapped("Global Settings");
+    if (UserOutdated) {
+        ImGui::SameLine(135);
+        ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().error_color);
+        ImGui::TextWrapped("(OUTDATED VERSION)");
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::SameLine(ImGui::GetWindowWidth() - 795);
+    ImGui::TextWrapped("DISCLAIMER: THIS IS NOT A CHEAT, IT NEVER INTERACTS WITH ROBLOX MEMORY.");
+
+    ImGui::PushStyleColor(ImGuiCol_Text, macrotoggled ? GetCurrentTheme().success_color : GetCurrentTheme().error_color);
+    ImGui::AlignTextToFramePadding();
+#if defined(_WIN32)
+    ImGui::Checkbox("Macro Toggle (Anti-AFK remains!)", &macrotoggled);
+#else
+    ImGui::Checkbox("Macro Toggle", &macrotoggled);
+#endif
+    ImGui::PopStyleColor();
+
+    ImGui::SameLine(ImGui::GetWindowWidth() - 790);
+    ImGui::TextWrapped("The ONLY official source for this is");
+    ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().accent_secondary);
+    ImGui::SameLine(ImGui::GetWindowWidth() - 499);
+    ImGui::TextWrapped("https://github.com/Spencer0187/Spencer-Macro-Utilities");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked() && context.openExternalUrl) {
+            context.openExternalUrl("https://github.com/Spencer0187/Spencer-Macro-Utilities");
+        }
+    }
+    ImGui::PopStyleColor();
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextWrapped(g_isLinuxWine ? "Roblox Executable Name/PIDs (Space Separated):" : "Roblox Executable Name:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(250.0f);
+    if (ImGui::InputText("##SettingsTextbox", settingsBuffer, sizeof(settingsBuffer))) {
+        TrimWhitespace(settingsBuffer);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("R", ImVec2(25, 0))) {
+        std::snprintf(settingsBuffer, sizeof(settingsBuffer), "%s", g_isLinuxWine ? "sober" : "RobloxPlayerBeta.exe");
+    }
+    ImGui::SameLine();
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    pos.y += ImGui::GetTextLineHeight() / 2 - 3;
+    ImU32 color = processFound ? ImGui::ColorConvertFloat4ToU32(GetCurrentTheme().success_color) : ImGui::ColorConvertFloat4ToU32(GetCurrentTheme().error_color);
+    drawList->AddCircleFilled(ImVec2(pos.x + 5, pos.y + 6), 5, color);
+    ImGui::Dummy(ImVec2(10, 10));
+    if (!processFound) {
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 1);
+        if (!g_isLinuxWine) {
+            ImGui::TextWrapped("Roblox Not Found");
+        }
+    }
+
+    ImGui::SameLine(ImGui::GetWindowWidth() - 360);
+    ImVec2 tooltipCursorPos = ImGui::GetCursorScreenPos();
+    ImGui::Text("Toggle Anti-AFK (");
+    ImGui::SameLine(0, 0);
+    ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().accent_primary);
+    ImGui::Text("?");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 0);
+    ImGui::Text("):");
+    ImGui::SetCursorScreenPos(tooltipCursorPos);
+    ImVec2 textSizeCalc = ImGui::CalcTextSize("Toggle Anti-AFK (?)");
+    ImGui::InvisibleButton("##tooltip", textSizeCalc);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Anti-AFK is currently available on Windows only.\nAnti-AFK functions by counting up a timer constantly. If you are tabbed into Roblox\nand you press any key on your keyboard, the timer resets.\nIf the timer expires, it presses your configured Anti-AFK key directly.\nIf Roblox is not foreground, it briefly focuses the window first.");
+    }
+    ImGui::SetCursorScreenPos(ImVec2(tooltipCursorPos.x + textSizeCalc.x, tooltipCursorPos.y));
+    ImGui::SameLine(ImGui::GetCursorScreenPos().x + 5);
+#if !defined(_WIN32)
+    antiafktoggle = false;
+    ImGui::BeginDisabled(true);
+#endif
+    ImGui::Checkbox("##AntiAFKToggle", &antiafktoggle);
+#if !defined(_WIN32)
+    ImGui::EndDisabled();
+#endif
+
+    ImGui::SameLine(ImGui::GetWindowWidth() - 130);
+    ImGui::Text("%s", ("VERSION " + localVersion).c_str());
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextWrapped("Roblox Sensitivity (0-4):");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(70.0f);
+    if (ImGui::InputText("##Sens", RobloxSensValue, sizeof(RobloxSensValue), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+        PreviousSensValue = -1;
+        float sensValue = static_cast<float>(std::atof(RobloxSensValue));
+        if (sensValue != 0.0f) {
+            for (auto& winst : wallhop_instances) {
+                float pixels = static_cast<float>(std::atof(winst.WallhopDegrees)) * (camfixtoggle ? 1000.0f : 720.0f) / (360.0f * sensValue);
+                std::snprintf(winst.WallhopPixels, sizeof(WallhopInstance::WallhopPixels), "%.0f", pixels);
+                try {
+                    winst.wallhop_dx = static_cast<int>(std::round(std::stoi(winst.WallhopPixels)));
+                    winst.wallhop_dy = -static_cast<int>(std::round(std::stoi(winst.WallhopPixels)));
+                } catch (...) {}
+            }
+        }
+    }
+    ImGui::SameLine();
+    ImGui::TextWrapped("Your Roblox FPS:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(40.0f);
+    if (ImGui::InputText("##FPS", RobloxFPSChar, sizeof(RobloxFPSChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+        SyncRobloxFPSFromBuffer();
+    }
+    ImGui::SameLine();
+    ImGui::Text("Game Uses Cam-Fix:");
+    ImGui::SameLine();
+
+    if (ImGui::Checkbox("##CamfixToggle", &camfixtoggle) || PreviousSensValue == -1) {
+        PreviousSensValue = -1;
+        PreviousWallWalkValue = -1;
+        float currentWallWalkValue = static_cast<float>(std::atof(RobloxSensValue));
+        float baseValue = camfixtoggle ? 500.0f : 360.0f;
+        if (currentWallWalkValue != 0.0f) {
+            wallwalk_strengthx = -static_cast<int>(std::round((baseValue / currentWallWalkValue) * 0.13f));
+            wallwalk_strengthy = static_cast<int>(std::round((baseValue / currentWallWalkValue) * 0.13f));
+            std::snprintf(RobloxWallWalkValueChar, sizeof(RobloxWallWalkValueChar), "%d", wallwalk_strengthx);
+        }
+        float currentSensValue = static_cast<float>(std::atof(RobloxSensValue));
+        if (currentSensValue != 0.0f) {
+            float speedBase = camfixtoggle ? 500.0f : 360.0f;
+            RobloxPixelValue = static_cast<int>(std::round((speedBase / currentSensValue) * (359.0f / 360.0f) * (359.0f / 360.0f)));
+            PreviousSensValue = currentSensValue;
+            std::snprintf(RobloxPixelValueChar, sizeof(RobloxPixelValueChar), "%d", RobloxPixelValue);
+            speed_strengthx = RobloxPixelValue;
+            speed_strengthy = -RobloxPixelValue;
+        }
+    }
+
+#if defined(__APPLE__)
+    ImGui::SameLine();
+    ImVec2 macosCursorTooltipPos = ImGui::GetCursorScreenPos();
+    ImGui::Text("Swap Movement Mode (");
+    ImGui::SameLine(0, 0);
+    ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().accent_primary);
+    ImGui::Text("?");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 0);
+    ImGui::Text("):");
+    ImVec2 macosCursorTooltipSize = ImGui::CalcTextSize("Swap Movement Mode (?)");
+    ImGui::SetCursorScreenPos(macosCursorTooltipPos);
+    ImGui::InvisibleButton("##MacOSCursorMovementTooltip", macosCursorTooltipSize);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Off: macOS uses relative input, best for locked-camera games like Roblox.\nOn: macOS moves the visible cursor, best for desktop/non-game automation.\nThis toggle exists because Quartz synthetic mouse events cannot perfectly do both at once.");
+    }
+    ImGui::SetCursorScreenPos(ImVec2(macosCursorTooltipPos.x + macosCursorTooltipSize.x, macosCursorTooltipPos.y));
+    ImGui::SameLine(ImGui::GetCursorScreenPos().x + 5);
+    ImGui::Checkbox("##MacOSCursorMovement", &macos_cursor_movement);
+#endif
+
+    static bool showSettingsMenu = false;
+    ImGui::SameLine(ImGui::GetWindowWidth() - 107);
+    if (showSettingsMenu ? ImGui::Button("Settings <-") : ImGui::Button("Settings ->")) {
+        showSettingsMenu = !showSettingsMenu;
+    }
+    RenderSettingsMenu(context, &showSettingsMenu);
+
+    ImGui::SameLine(ImGui::GetWindowWidth() - 257);
+    if (show_theme_menu ? ImGui::Button("Theme Editor <-") : ImGui::Button("Theme Editor ->")) {
+        show_theme_menu = !show_theme_menu;
+    }
+    RenderSharedThemeEditor(&show_theme_menu);
+
+    (void)displaySize;
+}
+
+void RenderSectionSidebar(float leftPanelWidth)
+{
+    for (size_t displayIndex = 0; displayIndex < section_amounts; ++displayIndex) {
+        int i = section_order[displayIndex];
+        ImGui::PushID(i);
+
+        float buttonWidth = leftPanelWidth - ImGui::GetStyle().FramePadding.x * 2;
+        Globals::Theme& theme = GetCurrentTheme();
+
+        bool sectionActive = section_toggles[i];
+        if (i == 5) {
+            sectionActive = !presskey_instances.empty() && presskey_instances[0].section_enabled;
+        } else if (i == 6) {
+            sectionActive = !wallhop_instances.empty() && wallhop_instances[0].section_enabled;
+        } else if (i == 11) {
+            sectionActive = !spamkey_instances.empty() && spamkey_instances[0].section_enabled;
+        }
+
+        if (sectionActive) {
+            if (selected_section == i) {
+                ImGui::PushStyleColor(ImGuiCol_Button, Brighten(theme.accent_primary, 1.4f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Brighten(theme.accent_primary, 1.6f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, Brighten(theme.accent_primary, 1.7f));
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, theme.accent_primary);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Brighten(theme.accent_primary, 1.3f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, Brighten(theme.accent_primary, 0.8f));
+            }
+        } else {
+            if (selected_section == i) {
+                ImGui::PushStyleColor(ImGuiCol_Button, Brighten(theme.disabled_color, 1.6f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Brighten(theme.disabled_color, 1.9f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, Brighten(theme.disabled_color, 2.1f));
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, theme.disabled_color);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Brighten(theme.disabled_color, 1.3f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, Brighten(theme.disabled_color, 1.1f));
+            }
+        }
+
+        ImVec2 titleSize = ImGui::CalcTextSize(sections[i].title.c_str(), nullptr, true);
+        ImVec2 descriptionSize = ImGui::CalcTextSize(sections[i].description.c_str(), nullptr, true, buttonWidth - 20);
+        float buttonHeight = titleSize.y + descriptionSize.y + ImGui::GetStyle().FramePadding.y * 2;
+        const float scrollAdjustment = ImGui::GetScrollMaxY() == 0 ? 7.0f : 18.0f;
+        if (ImGui::Button("", ImVec2(buttonWidth - scrollAdjustment, buttonHeight))) {
+            selected_section = i;
+            g_selected_imported_script = -1;
+            if (i == 5) selected_presskey_instance = 0;
+            else if (i == 6) selected_wallhop_instance = 0;
+            else if (i == 11) selected_spamkey_instance = 0;
+        }
+
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+            int payloadIndex = static_cast<int>(displayIndex);
+            ImGui::SetDragDropPayload("DND_SECTION", &payloadIndex, sizeof(int));
+            ImGui::EndDragDropSource();
+        }
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("DND_SECTION")) {
+                int payloadIndex = *(const int*)payload->Data;
+                std::swap(section_order[payloadIndex], section_order[displayIndex]);
+            }
+            ImGui::EndDragDropTarget();
+        }
+
+        ImVec2 buttonPos = ImGui::GetItemRectMin();
+        ImVec2 textPos(buttonPos.x + ImGui::GetStyle().FramePadding.x, buttonPos.y + ImGui::GetStyle().FramePadding.y);
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        drawList->AddText(textPos, ImGui::ColorConvertFloat4ToU32(GetCurrentTheme().text_primary), sections[i].title.c_str());
+
+        std::stringstream ss(sections[i].description);
+        std::string word;
+        std::string currentLine;
+        textPos.y += titleSize.y;
+        const float wrapWidth = buttonWidth - (ImGui::GetScrollMaxY() == 0 ? 11.0f : 22.0f);
+        while (ss >> word) {
+            std::string potentialLine = currentLine + (currentLine.empty() ? "" : " ") + word;
+            if (ImGui::CalcTextSize(potentialLine.c_str()).x > wrapWidth) {
+                drawList->AddText(textPos, ImGui::ColorConvertFloat4ToU32(GetCurrentTheme().text_primary), currentLine.c_str());
+                textPos.y += ImGui::GetTextLineHeight();
+                currentLine = word;
+            } else {
+                currentLine = potentialLine;
+            }
+        }
+        if (!currentLine.empty()) {
+            drawList->AddText(textPos, ImGui::ColorConvertFloat4ToU32(GetCurrentTheme().text_primary), currentLine.c_str());
+        }
+
+        ImGui::PopStyleColor(3);
+        ImGui::PopID();
+
+        if (i == 5 || i == 6 || i == 11) {
+            float subBtnW = (ImGui::GetScrollMaxY() == 0) ? (buttonWidth - 7) : (buttonWidth - 18);
+            size_t instCount = (i == 5) ? presskey_instances.size() : (i == 6) ? wallhop_instances.size() : spamkey_instances.size();
+            int& selInst = (i == 5) ? selected_presskey_instance : (i == 6) ? selected_wallhop_instance : selected_spamkey_instance;
+
+            for (size_t j = 1; j < instCount; ++j) {
+                ImGui::PushID(static_cast<int>(j) * 1000 + i);
+                bool instEnabled = (i == 5) ? presskey_instances[j].section_enabled : (i == 6) ? wallhop_instances[j].section_enabled : spamkey_instances[j].section_enabled;
+                bool isSelJ = selected_section == i && selInst == static_cast<int>(j);
+                ImGui::PushStyleColor(ImGuiCol_Button, instEnabled ? (isSelJ ? Brighten(theme.accent_primary, 1.4f) : theme.accent_primary) : (isSelJ ? Brighten(theme.disabled_color, 1.6f) : theme.disabled_color));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Brighten(theme.accent_primary, 1.3f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, Brighten(theme.accent_primary, 0.8f));
+                std::string subLabel = BuildMultiInstanceName(i, static_cast<int>(j) + 1);
+                if (ImGui::Button(subLabel.c_str(), ImVec2(subBtnW, 0))) {
+                    selected_section = i;
+                    g_selected_imported_script = -1;
+                    selInst = static_cast<int>(j);
+                }
+                ImGui::PopStyleColor(3);
+                ImGui::PopID();
+            }
+
+            ImGui::PushID(9999 + i);
+            ImGui::PushStyleColor(ImGuiCol_Button, theme.bg_light);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Brighten(theme.bg_light, 1.3f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, Brighten(theme.bg_light, 1.1f));
+            if (ImGui::Button("+", ImVec2(subBtnW, 0))) {
+                if (i == 5) presskey_instances.emplace_back();
+                else if (i == 6) wallhop_instances.emplace_back();
+                else if (i == 11) spamkey_instances.emplace_back();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Add a new independent instance of this macro");
+            }
+            ImGui::PopStyleColor(3);
+            ImGui::PopID();
+        }
+
+        ImGui::Separator();
+    }
+}
+
+void RenderImportedScriptsSidebar(float leftPanelWidth)
+{
+    ScriptManager& manager = ScriptManager::Get();
+    Globals::Theme& theme = GetCurrentTheme();
+    const float buttonWidth = leftPanelWidth - ImGui::GetStyle().FramePadding.x * 2;
+    const float scrollAdjustment = ImGui::GetScrollMaxY() == 0 ? 7.0f : 18.0f;
+    const float itemWidth = buttonWidth - scrollAdjustment;
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Imported Scripts");
+    if (ImGui::Button("+ Import Script", ImVec2(itemWidth, 0.0f))) {
+        StartImportedScriptImportFlow();
+    }
+
+    const auto scripts = manager.snapshot();
+    for (std::size_t index = 0; index < scripts.size(); ++index) {
+        const auto& script = scripts[index];
+        if (!script) {
+            continue;
+        }
+
+        const bool selected = g_selected_imported_script == static_cast<int>(index);
+        const bool missing = script->missing.load(std::memory_order_acquire);
+        const bool loaded = script->loaded.load(std::memory_order_acquire);
+        const bool running = script->running.load(std::memory_order_acquire);
+        const bool enabled = script->enabled.load(std::memory_order_acquire);
+        const std::string lastError = script->lastErrorCopy();
+        const bool attention = missing || (!loaded && !lastError.empty());
+        const bool active = enabled && loaded && !missing;
+
+        ImGui::PushID(static_cast<int>(index));
+        if (attention) {
+            ImGui::PushStyleColor(ImGuiCol_Button, selected ? Brighten(theme.error_color, 1.3f) : theme.error_color);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Brighten(theme.error_color, 1.4f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, Brighten(theme.error_color, 0.9f));
+        } else if (active) {
+            ImGui::PushStyleColor(ImGuiCol_Button, selected ? Brighten(theme.accent_primary, 1.4f) : theme.accent_primary);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Brighten(theme.accent_primary, 1.3f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, Brighten(theme.accent_primary, 0.8f));
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, selected ? Brighten(theme.disabled_color, 1.6f) : theme.disabled_color);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Brighten(theme.disabled_color, 1.3f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, Brighten(theme.disabled_color, 1.1f));
+        }
+
+        std::string label = script->metadata.name.empty() ? script->path.stem().string() : script->metadata.name;
+        if (running) {
+            label += " (Running)";
+        } else if (missing) {
+            label += " (Missing)";
+        } else if (!loaded) {
+            label += " (Error)";
+        }
+
+        if (ImGui::Button(label.c_str(), ImVec2(itemWidth, 0.0f))) {
+            g_selected_imported_script = static_cast<int>(index);
+            selected_section = -1;
+        }
+
+        ImGui::PopStyleColor(3);
+        ImGui::PopID();
+    }
+
+    if (!g_import_error.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, theme.error_color);
+        ImGui::TextWrapped("%s", g_import_error.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Separator();
+}
+
+void RenderRemoveInstanceButton(const std::string& id, int sectionIndex, size_t instanceCount, int selectedInstance, std::atomic<int>& removeRequest)
+{
+    if (instanceCount <= 1) {
+        return;
+    }
+
+    const int removeTarget = GetInstanceRemovalTargetIndex(instanceCount, selectedInstance);
+    const bool removingMainSlot = selectedInstance == 0;
+    const bool isConfirmArmed = g_instance_remove_confirm_state.stage == 1 &&
+        g_instance_remove_confirm_state.section_index == sectionIndex &&
+        g_instance_remove_confirm_state.target_instance_index == removeTarget;
+
+    ImGui::SameLine();
+    if (isConfirmArmed) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 1.0f, 0.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 0.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 1.0f, 0.0f, 1.0f));
+    }
+
+    std::string label = removingMainSlot ? "- Remove Last Instance" : "- Remove Current Instance";
+    bool clicked = ImGui::Button((label + "##" + id).c_str());
+
+    if (isConfirmArmed) {
+        ImGui::PopStyleColor(4);
+    }
+
+    if (clicked) {
+        if (isConfirmArmed) {
+            removeRequest.store(removeTarget, std::memory_order_release);
+            if (sectionIndex == 5 && removeTarget > 0 && removeTarget < static_cast<int>(presskey_instances.size())) {
+                for (int i = removeTarget; i < static_cast<int>(presskey_instances.size()) - 1; ++i) {
+                    CopyPresskeyInstanceData(presskey_instances[i + 1], presskey_instances[i]);
+                }
+                presskey_instances.pop_back();
+                selected_presskey_instance = std::min(selected_presskey_instance, static_cast<int>(presskey_instances.size()) - 1);
+            } else if (sectionIndex == 6 && removeTarget > 0 && removeTarget < static_cast<int>(wallhop_instances.size())) {
+                for (int i = removeTarget; i < static_cast<int>(wallhop_instances.size()) - 1; ++i) {
+                    CopyWallhopInstanceData(wallhop_instances[i + 1], wallhop_instances[i]);
+                }
+                wallhop_instances.pop_back();
+                selected_wallhop_instance = std::min(selected_wallhop_instance, static_cast<int>(wallhop_instances.size()) - 1);
+            } else if (sectionIndex == 11 && removeTarget > 0 && removeTarget < static_cast<int>(spamkey_instances.size())) {
+                for (int i = removeTarget; i < static_cast<int>(spamkey_instances.size()) - 1; ++i) {
+                    CopySpamkeyInstanceData(spamkey_instances[i + 1], spamkey_instances[i]);
+                }
+                spamkey_instances.pop_back();
+                selected_spamkey_instance = std::min(selected_spamkey_instance, static_cast<int>(spamkey_instances.size()) - 1);
+            }
+            ResetInstanceRemoveConfirmState();
+        } else {
+            g_instance_remove_confirm_state.stage = 1;
+            g_instance_remove_confirm_state.timer = 0.7f;
+            g_instance_remove_confirm_state.section_index = sectionIndex;
+            g_instance_remove_confirm_state.target_instance_index = removeTarget;
+        }
+    }
+}
+
+void RenderSelectedImportedScript(AppContext& context)
+{
+    ScriptManager& manager = ScriptManager::Get();
+    if (g_selected_imported_script < 0 || g_selected_imported_script >= static_cast<int>(manager.count())) {
+        ImGui::TextWrapped("Select a section to see its settings.");
+        return;
+    }
+
+    auto script = manager.get(static_cast<std::size_t>(g_selected_imported_script));
+    if (!script) {
+        ImGui::TextWrapped("Select a section to see its settings.");
+        return;
+    }
+
+    unsigned int hotkey = script->hotkey.load(std::memory_order_acquire);
+    bool enabled = script->enabled.load(std::memory_order_acquire);
+    bool disableOutside = script->disableOutsideRoblox.load(std::memory_order_acquire);
+    const bool running = script->running.load(std::memory_order_acquire);
+    const bool missing = script->missing.load(std::memory_order_acquire);
+    const bool loaded = script->loaded.load(std::memory_order_acquire);
+    const std::string lastError = script->lastErrorCopy();
+    const std::string lastWarning = script->lastWarningCopy();
+
+    const std::string title = script->metadata.name.empty() ? script->path.stem().string() : script->metadata.name;
+    ImGui::TextWrapped("Settings for %s", title.c_str());
+    ImGui::Separator();
+    ImGui::TextWrapped("Keybind:");
+    ImGui::SameLine();
+    DrawKeyBindControl(("ImportedScriptKey" + std::to_string(g_selected_imported_script)).c_str(), hotkey, -1);
+    script->hotkey.store(hotkey, std::memory_order_release);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, enabled ? GetCurrentTheme().success_color : GetCurrentTheme().error_color);
+    ImGui::TextWrapped("Enable This Script:");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    if (ImGui::Checkbox(("##ImportedScriptEnabled" + std::to_string(g_selected_imported_script)).c_str(), &enabled)) {
+        script->enabled.store(enabled, std::memory_order_release);
+    }
+
+    ImGui::SameLine();
+    RenderForegroundDependentCheckbox(
+        context,
+        "Disable outside of Target Application:",
+        ("##ImportedScriptDisableOutside" + std::to_string(g_selected_imported_script)).c_str(),
+        &disableOutside);
+    script->disableOutsideRoblox.store(disableOutside, std::memory_order_release);
+
+    const bool actionsDisabled = running;
+    if (actionsDisabled) {
+        ImGui::BeginDisabled();
+    }
+
+    if (ImGui::Button("Execute Now")) {
+        const std::size_t index = static_cast<std::size_t>(g_selected_imported_script);
+        std::thread([index] {
+            ScriptManager::Get().executeScript(index);
+        }).detach();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload")) {
+        manager.reloadScript(static_cast<std::size_t>(g_selected_imported_script));
+    }
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button, GetCurrentTheme().error_color);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Brighten(GetCurrentTheme().error_color, 1.2f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, Brighten(GetCurrentTheme().error_color, 0.8f));
+    if (ImGui::Button("Remove")) {
+        if (manager.removeScript(static_cast<std::size_t>(g_selected_imported_script))) {
+            g_selected_imported_script = -1;
+        }
+    }
+    ImGui::PopStyleColor(3);
+
+    if (actionsDisabled) {
+        ImGui::EndDisabled();
+    }
+
+    if (!running) {
+        ImGui::BeginDisabled();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Force Stop")) {
+        manager.forceStopScript(static_cast<std::size_t>(g_selected_imported_script));
+    }
+    if (!running) {
+        ImGui::EndDisabled();
+    }
+
+    ImGui::Separator();
+    const char* status = "Loaded";
+    ImVec4 statusColor = GetCurrentTheme().success_color;
+    if (running) {
+        status = "Running";
+        statusColor = GetCurrentTheme().accent_primary;
+    } else if (missing) {
+        status = "Missing";
+        statusColor = GetCurrentTheme().error_color;
+    } else if (!loaded) {
+        status = "Error";
+        statusColor = GetCurrentTheme().error_color;
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, statusColor);
+    ImGui::TextWrapped("Status: %s", status);
+    ImGui::PopStyleColor();
+    if (!lastError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().error_color);
+        ImGui::TextWrapped("%s", lastError.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (!lastWarning.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().warning_color);
+        ImGui::TextWrapped("%s", lastWarning.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    if (!script->metadata.description.empty()) {
+        ImGui::TextWrapped("%s", script->metadata.description.c_str());
+        ImGui::Spacing();
+    }
+    if (!script->metadata.author.empty()) {
+        ImGui::TextWrapped("Author: %s", script->metadata.author.c_str());
+    }
+    if (!script->metadata.version.empty()) {
+        ImGui::TextWrapped("Version: %s", script->metadata.version.c_str());
+    }
+    ImGui::TextWrapped("File: %s", SanitizePathForDisplay(script->path).c_str());
+
+    ImGui::Separator();
+    ImGui::TextWrapped("Custom Settings");
+    if (running) {
+        if (script->instance && script->instance->hasSettingsCallback()) {
+            ImGui::TextWrapped("Settings are read-only while the script is running. Dynamic text stays live and copyable.");
+            script->instance->renderCachedSettings(true);
+        } else {
+            ImGui::TextWrapped("This script does not define onSettings().");
+        }
+    } else if (script->instance && script->instance->hasSettingsCallback()) {
+        if (!script->instance->callOnSettings(true)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().error_color);
+            ImGui::TextWrapped("Failed to render custom settings.");
+            ImGui::PopStyleColor();
+        }
+    } else {
+        ImGui::TextWrapped("This script does not define onSettings().");
+    }
+}
+
+void RenderSelectedSection(AppContext& context)
+{
+    if (g_selected_imported_script >= 0) {
+        RenderSelectedImportedScript(context);
+        return;
+    }
+
+    if (selected_section < 0 || selected_section >= static_cast<int>(sections.size())) {
+        ImGui::TextWrapped("Select a section to see its settings.");
+        return;
+    }
+
+    unsigned int* currentKey = nullptr;
+    bool* instanceEnabledPtr = nullptr;
+    if (selected_section == 5 && !presskey_instances.empty()) {
+        selected_presskey_instance = std::clamp(selected_presskey_instance, 0, static_cast<int>(presskey_instances.size()) - 1);
+        currentKey = &presskey_instances[selected_presskey_instance].vk_trigger;
+        instanceEnabledPtr = &presskey_instances[selected_presskey_instance].section_enabled;
+    } else if (selected_section == 6 && !wallhop_instances.empty()) {
+        selected_wallhop_instance = std::clamp(selected_wallhop_instance, 0, static_cast<int>(wallhop_instances.size()) - 1);
+        currentKey = &wallhop_instances[selected_wallhop_instance].vk_trigger;
+        instanceEnabledPtr = &wallhop_instances[selected_wallhop_instance].section_enabled;
+    } else if (selected_section == 11 && !spamkey_instances.empty()) {
+        selected_spamkey_instance = std::clamp(selected_spamkey_instance, 0, static_cast<int>(spamkey_instances.size()) - 1);
+        currentKey = &spamkey_instances[selected_spamkey_instance].vk_trigger;
+        instanceEnabledPtr = &spamkey_instances[selected_spamkey_instance].section_enabled;
+    } else {
+        currentKey = section_to_key.at(selected_section);
+    }
+
+    if ((selected_section == 5 || selected_section == 6 || selected_section == 11) &&
+        ((selected_section == 5 && presskey_instances.size() > 1) || (selected_section == 6 && wallhop_instances.size() > 1) || (selected_section == 11 && spamkey_instances.size() > 1))) {
+        int instanceIndex = selected_section == 5 ? selected_presskey_instance : selected_section == 6 ? selected_wallhop_instance : selected_spamkey_instance;
+        ImGui::TextWrapped("Settings for %s", BuildMultiInstanceName(selected_section, instanceIndex + 1).c_str());
+    } else {
+        ImGui::TextWrapped("Settings for %s", sections[selected_section].title.c_str());
+    }
+    ImGui::Separator();
+    ImGui::NewLine();
+
+    ImGui::TextWrapped("Keybind:");
+    ImGui::SameLine();
+    DrawKeyBindControl("SectionKey", *currentKey, selected_section);
+
+    bool toggleVal = instanceEnabledPtr ? *instanceEnabledPtr : section_toggles[selected_section];
+    ImGui::PushStyleColor(ImGuiCol_Text, toggleVal ? GetCurrentTheme().success_color : GetCurrentTheme().error_color);
+    ImGui::TextWrapped("Enable This Macro:");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    if (instanceEnabledPtr) {
+        ImGui::Checkbox(("##SectionToggle" + std::to_string(selected_section)).c_str(), instanceEnabledPtr);
+    } else {
+        ImGui::Checkbox(("##SectionToggle" + std::to_string(selected_section)).c_str(), &section_toggles[selected_section]);
+    }
+
+    if (bool* disableOutsidePtr = GetDisableOutsideTogglePtr(selected_section)) {
+        std::string disableOutsideId = "##DisableOutsideRoblox_" + std::to_string(selected_section);
+        if (selected_section == 5) disableOutsideId += "_" + std::to_string(selected_presskey_instance);
+        else if (selected_section == 6) disableOutsideId += "_" + std::to_string(selected_wallhop_instance);
+        else if (selected_section == 11) disableOutsideId += "_" + std::to_string(selected_spamkey_instance);
+        ImGui::SameLine();
+        RenderForegroundDependentCheckbox(context, "Disable outside of Target Application:", disableOutsideId.c_str(), disableOutsidePtr);
+    }
+
+    if (selected_section == 0) {
+        ImGui::TextWrapped("Automatically Unfreeze after this amount of seconds (Anti-Internet-Kick)");
+        ImGui::SetNextItemWidth(60.0f);
+        ImGui::InputFloat("##FreezeFloat", &maxfreezetime, 0.0f, 0.0f, "%.2f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(300.0f);
+        ImGui::SliderFloat("##FreezeSlider", &maxfreezetime, 0.0f, 9.8f, "%.2f Seconds");
+        char maxfreezeoverrideBuffer[16];
+        std::snprintf(maxfreezeoverrideBuffer, sizeof(maxfreezeoverrideBuffer), "%d", maxfreezeoverride);
+        ImGui::SetNextItemWidth(50.0f);
+        if (ImGui::InputText("Modify 50ms Default Unfreeze Time (MS)", maxfreezeoverrideBuffer, sizeof(maxfreezeoverrideBuffer), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            maxfreezeoverride = std::atoi(maxfreezeoverrideBuffer);
+        }
+        ImGui::Checkbox("Switch from Hold Key to Toggle Key", &isfreezeswitch);
+        if (isfreezeswitch || takeallprocessids) {
+            disable_outside_roblox[0] = false;
+        }
+        ImGui::Checkbox("Freeze all Found Processes Instead of Newest", &takeallprocessids);
+        ImGui::SameLine();
+        ImGui::TextWrapped("(ONLY EVER USE FOR COMPATIBILITY ISSUES WITH NON-ROBLOX GAMES)");
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("This macro freezes the Roblox process. It can be used for lag high jumps, extended clips, head-glide setups, and other timing glitches.");
+        ImGui::TextWrapped("Hold the hotkey to freeze and release it to unfreeze. In toggle mode, press once to freeze and press again to release. Auto-unfreeze keeps the process from staying suspended too long.");
+    }
+
+    if (selected_section == 1) {
+        ImGui::TextWrapped("Gear Slot:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(30.0f);
+        if (ImGui::InputText("##ItemDesync", ItemDesyncSlot, sizeof(ItemDesyncSlot), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            try { desync_slot = std::stoi(ItemDesyncSlot); } catch (...) {}
+        }
+        ImGui::Separator();
+        ImGui::TextWrapped("Equip your item in the slot selected here, then hold the keybind for about 4-7 seconds.");
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("This macro allows you to desynchronize a held item from the client and server. It rapidly sends slot inputs until Roblox starts throttling the item state.");
+        ImGui::TextWrapped("Use an item that does not make a server-side sound. Loud or server-driven gear can make the desync unstable and may stop your physics data from reaching the server cleanly.");
+        ImGui::Separator();
+        ImGui::TextWrapped("If 'Disable outside of Target Application' is enabled, this module will only run while tabbed into the target application. Turning it off allows use in other windows (use carefully).");
+    }
+
+    if (selected_section == 2) {
+        ImGui::Checkbox("Automatically time inputs", &autotoggle);
+        ImGui::SameLine();
+        ImGui::TextWrapped("(EXTREMELY BUGGY/EXPERIMENTAL, WORKS BEST ON HIGH FPS AND SHALLOW ANGLE TO WALL)");
+        ImGui::Checkbox("Decrease Freeze Duration (Speedrunner Mode)", &fasthhj);
+        if (ImGui::Button("R##HHJLength", ImVec2(25, 0))) {
+            HHJLength = 243;
+            std::snprintf(HHJLengthChar, sizeof(HHJLengthChar), "%d", HHJLength);
+        }
+        ImGui::SameLine();
+        ImGui::TextWrapped("Length of HHJ flicks (ms):");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(52);
+        if (ImGui::InputText("##HHJLength", HHJLengthChar, sizeof(HHJLengthChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            try { HHJLength = std::stoi(HHJLengthChar); } catch (...) {}
+        }
+        if (ImGui::CollapsingHeader("Advanced HHJ Options", showadvancedhhj ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+            showadvancedhhj = true;
+            auto drawTiming = [](const char* resetId, const char* label, int& value, char* buffer, size_t bufferSize, int defaultValue) {
+                ImGui::Indent();
+                if (ImGui::Button(resetId, ImVec2(25, 0))) {
+                    value = defaultValue;
+                    std::snprintf(buffer, bufferSize, "%d", value);
+                }
+                ImGui::SameLine();
+                ImGui::TextWrapped("%s", label);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(50);
+                if (ImGui::InputText((std::string("##") + resetId).c_str(), buffer, bufferSize, ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                    try { value = std::stoi(buffer); } catch (...) {}
+                }
+                ImGui::Unindent();
+            };
+            ImGui::Spacing();
+            ImGui::Indent();
+            if (ImGui::Button("R##HHJFreezeDelayOverride", ImVec2(25, 0))) {
+                HHJFreezeDelayOverride = 500;
+                std::snprintf(HHJFreezeDelayOverrideChar, sizeof(HHJFreezeDelayOverrideChar), "%d", HHJFreezeDelayOverride);
+                HHJFreezeDelayApply = false;
+            }
+            ImGui::SameLine();
+            ImGui::TextWrapped("Set freeze delay (ms): ");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(50);
+            if (ImGui::InputText("##HHJFreezeDelayOverride", HHJFreezeDelayOverrideChar, sizeof(HHJFreezeDelayOverrideChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                try { HHJFreezeDelayOverride = std::stoi(HHJFreezeDelayOverrideChar); } catch (...) {}
+            }
+            ImGui::SameLine();
+            ImGui::Checkbox("Apply##HHJFreezeDelayApply", &HHJFreezeDelayApply);
+            ImGui::Unindent();
+            drawTiming("R##HHJDelay1", "Delay after freezing before shiftlock is held (ms): ", HHJDelay1, HHJDelay1Char, sizeof(HHJDelay1Char), 9);
+            drawTiming("R##HHJDelay2", "Time shiftlock is held before spinning (ms): ", HHJDelay2, HHJDelay2Char, sizeof(HHJDelay2Char), 17);
+            drawTiming("R##HHJDelay3", "Time shiftlock is held after freezing (ms): ", HHJDelay3, HHJDelay3Char, sizeof(HHJDelay3Char), 16);
+        }
+        if (ImGui::CollapsingHeader("Customize Automatic HHJ", showautomatichhj ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+            showautomatichhj = true;
+            ImGui::Spacing();
+            ImGui::TextWrapped("First Key Press:");
+            ImGui::Indent();
+            if (ImGui::Button("R##AutoHHJKey1Reset", ImVec2(25, 0))) vk_autohhjkey1 = VK_SPACE;
+            ImGui::SameLine();
+            DrawKeyBindControl("AutoHHJKey1", vk_autohhjkey1, selected_section, 150.0f, 50.0f);
+            if (ImGui::Button("R##AutoHHJKey1Time", ImVec2(25, 0))) {
+                AutoHHJKey1Time = 550;
+                std::snprintf(AutoHHJKey1TimeChar, sizeof(AutoHHJKey1TimeChar), "%d", AutoHHJKey1Time);
+            }
+            ImGui::SameLine();
+            ImGui::TextWrapped("Hold time (ms): ");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(50);
+            if (ImGui::InputText("##AutoHHJKey1Time", AutoHHJKey1TimeChar, sizeof(AutoHHJKey1TimeChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                try { AutoHHJKey1Time = std::stoi(AutoHHJKey1TimeChar); } catch (...) {}
+            }
+            ImGui::Unindent();
+            ImGui::Spacing();
+            ImGui::TextWrapped("Second Key Press:");
+            ImGui::Indent();
+            if (ImGui::Button("R##AutoHHJKey2Reset", ImVec2(25, 0))) vk_autohhjkey2 = smu::core::SMU_VK_W;
+            ImGui::SameLine();
+            DrawKeyBindControl("AutoHHJKey2", vk_autohhjkey2, selected_section, 150.0f, 50.0f);
+            if (ImGui::Button("R##AutoHHJKey2Time", ImVec2(25, 0))) {
+                AutoHHJKey2Time = 68;
+                std::snprintf(AutoHHJKey2TimeChar, sizeof(AutoHHJKey2TimeChar), "%d", AutoHHJKey2Time);
+            }
+            ImGui::SameLine();
+            ImGui::TextWrapped("Hold time (ms): ");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(50);
+            if (ImGui::InputText("##AutoHHJKey2Time", AutoHHJKey2TimeChar, sizeof(AutoHHJKey2TimeChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                try { AutoHHJKey2Time = std::stoi(AutoHHJKey2TimeChar); } catch (...) {}
+            }
+            ImGui::Unindent();
+        }
+        ImGui::Separator();
+        ImGui::TextWrapped("This macro allows you to jump very high when used properly. It uses COM offset, angular velocity, and Roblox's center-of-mass behavior to launch you upward.");
+        ImGui::Separator();
+        ImGui::TextWrapped("IMPORTANT:");
+        ImGui::TextWrapped("Have your Sensitivity and Cam-Fix options set before using this module.");
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("First create COM offset, usually with Item Unequip COM Offset. Then align your back near the wall, rotate slightly left, turn your camera toward the wall, hold W, and trigger the macro.");
+        ImGui::TextWrapped("Reference video coming soon!");
+    }
+
+    if (selected_section == 3) {
+        float currentSensValue = static_cast<float>(std::atof(RobloxSensValue));
+        if (currentSensValue != 0.0f && currentSensValue != PreviousSensValue) {
+            RobloxPixelValue = static_cast<int>(((camfixtoggle ? 500.0f : 360.0f) / currentSensValue) * (359.0f / 360.0f) + 0.5f);
+            PreviousSensValue = currentSensValue;
+            std::snprintf(RobloxPixelValueChar, sizeof(RobloxPixelValueChar), "%d", RobloxPixelValue);
+        }
+        ImGui::TextWrapped("Pixel Value for 180 Degree Turn BASED ON SENSITIVITY:");
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::SameLine();
+        if (ImGui::InputText("##PixelValue", RobloxPixelValueChar, sizeof(RobloxPixelValueChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            try {
+                speed_strengthx = std::stoi(RobloxPixelValueChar);
+                speed_strengthy = -std::stoi(RobloxPixelValueChar);
+            } catch (...) {}
+        }
+        ImGui::Checkbox("Switch from Toggle Key to Hold Key", &isspeedswitch);
+        ImGui::TextWrapped("This macro allows you to travel extremely fast in midair. It uses COM offset and a timed 180 degree camera turn to convert angular velocity into regular velocity.");
+        ImGui::Separator();
+        ImGui::TextWrapped("IMPORTANT: Have your Sensitivity and Cam-Fix options set before using this module.");
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("Enable shiftlock, press the keybind once, then jump and hold W. The macro should rotate you exactly 180 degrees. If the turn is off, fix your Roblox sensitivity and Cam-Fix settings first.");
+        ImGui::TextWrapped("Reference video:");
+        ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().accent_secondary);
+        ImGui::SameLine();
+        ImGui::TextWrapped("https://www.youtube.com/watch?v=5rmeivUegHc");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsItemClicked() && context.openExternalUrl) {
+                context.openExternalUrl("https://www.youtube.com/watch?v=5rmeivUegHc");
+            }
+        }
+        ImGui::PopStyleColor();
+    }
+
+    if (selected_section == 4) {
+        ImGui::TextWrapped("Gear Slot:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(30.0f);
+        if (ImGui::InputText("##Gearslot", ItemSpeedSlot, sizeof(ItemSpeedSlot), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            try { speed_slot = std::stoi(ItemSpeedSlot); } catch (...) {}
+        }
+        ImGui::TextWrapped("Type in a custom chat message! (Disables gear equipping, just pastes your message in chat)");
+        ImGui::TextWrapped("(Leave this blank if you don't want a custom message)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        ImGui::InputText("##CustomText", CustomTextChar, sizeof(CustomTextChar));
+        ImGui::SetNextItemWidth(150.0f);
+        if (ImGui::BeginCombo("Select Emote", optionsforoffset[selected_dropdown])) {
+            for (int i = 0; i < IM_ARRAYSIZE(optionsforoffset); i++) {
+                bool isSelected = selected_dropdown == i;
+                if (ImGui::Selectable(optionsforoffset[i], isSelected)) {
+                    selected_dropdown = i;
+                    text = optionsforoffset[selected_dropdown];
+                }
+                if (isSelected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextWrapped("Key to Press After Message/Emote paste:");
+        ImGui::SameLine();
+        DrawKeyBindControl("EnterKey", vk_enterkey, selected_section, 170.0f, 130.0f, true);
+        ImGui::Checkbox("Let the macro Keep the item equipped", &unequiptoggle);
+        ImGui::Separator();
+        ImGui::TextWrapped("IMPORTANT: This automatic emote unequip setup has been patched by Roblox in many places. You may still get a small COM offset manually by equipping an item without animation.");
+        ImGui::Separator();
+        ImGui::TextWrapped("This macro allows you to create COM offset by sending an emote or custom chat message, then unequipping an item from the chosen slot. HHJ, Speedglitch, and Walless LHJ rely on this kind of offset.");
+    }
+
+    if (selected_section == 5) {
+        if (presskey_instances.empty()) {
+            ImGui::TextWrapped("No presskey instances.");
+        } else {
+            PresskeyInstance& inst = presskey_instances[selected_presskey_instance];
+            std::string sid = "_pk" + std::to_string(selected_presskey_instance);
+            if (presskey_instances.size() > 1) {
+                ImGui::TextWrapped("%s of %d", BuildMultiInstanceName(5, selected_presskey_instance + 1).c_str(), static_cast<int>(presskey_instances.size()));
+                ImGui::SameLine();
+            }
+            if (ImGui::Button(("+ Add New##AddPK" + sid).c_str())) presskey_instances.emplace_back();
+            RenderRemoveInstanceButton("RemPK" + sid, 5, presskey_instances.size(), selected_presskey_instance, request_remove_presskey_instance_index);
+            ImGui::Separator();
+            ImGui::TextWrapped("Key to Press:");
+            ImGui::SameLine();
+            DrawKeyBindControl(("PressKey" + sid).c_str(), inst.vk_presskey, selected_section, 170.0f, 130.0f, true);
+            ImGui::Text("Length of Second Button Press (ms):");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            if (ImGui::InputText(("##PressKeyDelayChar" + sid).c_str(), inst.PressKeyDelayChar, sizeof(PresskeyInstance::PressKeyDelayChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                try { inst.PressKeyDelay = std::stoi(inst.PressKeyDelayChar); } catch (...) {}
+            }
+            ImGui::Text("Delay Before Second Press (ms):");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            if (ImGui::InputText(("##PressKeyBonusDelayChar" + sid).c_str(), inst.PressKeyBonusDelayChar, sizeof(PresskeyInstance::PressKeyBonusDelayChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                try { inst.PressKeyBonusDelay = std::stoi(inst.PressKeyBonusDelayChar); } catch (...) {}
+            }
+            ImGui::Separator();
+            ImGui::TextWrapped("Explanation:");
+            ImGui::NewLine();
+            ImGui::TextWrapped("This macro allows you to press another key for a short moment whenever you trigger the macro. It is useful for micro-adjustments while moving, especially while jumping.");
+        }
+    }
+
+    if (selected_section == 6) {
+        if (wallhop_instances.empty()) {
+            ImGui::TextWrapped("No wallhop instances.");
+        } else {
+            WallhopInstance& inst = wallhop_instances[selected_wallhop_instance];
+            std::string sid = "_wh" + std::to_string(selected_wallhop_instance);
+            if (wallhop_instances.size() > 1) {
+                ImGui::TextWrapped("%s of %d", BuildMultiInstanceName(6, selected_wallhop_instance + 1).c_str(), static_cast<int>(wallhop_instances.size()));
+                ImGui::SameLine();
+            }
+            if (ImGui::Button(("+ Add New##AddWH" + sid).c_str())) wallhop_instances.emplace_back();
+            RenderRemoveInstanceButton("RemWH" + sid, 6, wallhop_instances.size(), selected_wallhop_instance, request_remove_wallhop_instance_index);
+            ImGui::Separator();
+            ImGui::TextWrapped("Flick Degrees (Estimated):");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(70.0f);
+            float sensValue = static_cast<float>(std::atof(RobloxSensValue));
+            if (sensValue != 0.0f) {
+                std::snprintf(inst.WallhopDegrees, sizeof(WallhopInstance::WallhopDegrees), "%d", static_cast<int>(360 * (std::atof(inst.WallhopPixels) * std::atof(RobloxSensValue)) / (camfixtoggle ? 1000 : 720)));
+            }
+            if (ImGui::InputText(("##WallhopDegrees" + sid).c_str(), inst.WallhopDegrees, sizeof(WallhopInstance::WallhopDegrees), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                float pixels = static_cast<float>(std::atof(inst.WallhopDegrees) * (camfixtoggle ? 1000.0f : 720.0f) / (360.0f * std::atof(RobloxSensValue)));
+                std::snprintf(inst.WallhopPixels, sizeof(WallhopInstance::WallhopPixels), "%.0f", pixels);
+                try {
+                    inst.wallhop_dx = static_cast<int>(std::round(std::stoi(inst.WallhopPixels)));
+                    inst.wallhop_dy = -static_cast<int>(std::round(std::stoi(inst.WallhopPixels)));
+                } catch (...) {}
+            }
+            ImGui::TextWrapped("Flick Pixel Amount:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(70.0f);
+            if (ImGui::InputText(("##WallhopPixels" + sid).c_str(), inst.WallhopPixels, sizeof(WallhopInstance::WallhopPixels), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                try {
+                    inst.wallhop_dx = static_cast<int>(std::round(std::stoi(inst.WallhopPixels)));
+                    inst.wallhop_dy = -static_cast<int>(std::round(std::stoi(inst.WallhopPixels)));
+                } catch (...) {}
+            }
+            ImGui::SameLine();
+            ImGui::Text("Vertical Pixel Movement:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(70.0f);
+            if (ImGui::InputText(("##WallhopVertical" + sid).c_str(), inst.WallhopVerticalChar, sizeof(inst.WallhopVerticalChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                try { inst.wallhop_vertical = static_cast<int>(std::round(std::stoi(inst.WallhopVerticalChar))); } catch (...) {}
+            }
+            ImGui::TextWrapped("Wallhop Length (ms):");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(70.0f);
+            if (ImGui::InputText(("##WallhopDelay" + sid).c_str(), inst.WallhopDelayChar, sizeof(WallhopInstance::WallhopDelayChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                try { inst.WallhopDelay = static_cast<int>(std::round(std::stoi(inst.WallhopDelayChar))); } catch (...) {}
+            }
+            ImGui::TextWrapped("Bonus Wallhop Delay Before Jumping (ms):");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(70.0f);
+            if (ImGui::InputText(("##WallhopBonusDelay" + sid).c_str(), inst.WallhopBonusDelayChar, sizeof(WallhopInstance::WallhopBonusDelayChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                try { inst.WallhopBonusDelay = static_cast<int>(std::round(std::stoi(inst.WallhopBonusDelayChar))); } catch (...) {}
+            }
+            ImGui::Checkbox(("Switch to Left-Flick Wallhop##" + sid).c_str(), &inst.wallhopswitch);
+            ImGui::Checkbox(("Jump During Wallhop##" + sid).c_str(), &inst.toggle_jump);
+            ImGui::Checkbox(("Flick-Back During Wallhop##" + sid).c_str(), &inst.toggle_flick);
+            if (ImGui::CollapsingHeader(("Hotkeys##WallhopHotkeys" + sid).c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImGui::Button(("R##WallhopJumpKeyReset" + sid).c_str(), ImVec2(25, 0))) inst.vk_jumpkey = VK_SPACE;
+                ImGui::SameLine();
+                ImGui::TextWrapped("Jump Key:");
+                ImGui::SameLine();
+                DrawKeyBindControl(("WallhopJumpKey" + sid).c_str(), inst.vk_jumpkey, selected_section, 150.0f, 50.0f);
+            }
+            ImGui::Separator();
+            ImGui::TextWrapped("IMPORTANT:");
+            ImGui::TextWrapped("THE ANGLE THAT YOU TURN IS DIRECTLY RELATED TO YOUR ROBLOX SENSITIVITY. INTEGERS ONLY!");
+            ImGui::Separator();
+            ImGui::TextWrapped("Explanation:");
+            ImGui::NewLine();
+            ImGui::TextWrapped("This macro allows you to double jump on stacked wall parts by flicking and jumping automatically.");
+            RenderCenteredMacroTutorialImage(MacroTutorialImage::Wallhop, 248.0f, 140.0f);
+            ImGui::TextWrapped("Set your Roblox sensitivity and flick angle first. After this, line up on a wall seam and trigger the macro. You can tune left/right flicking, jumping, and flick-back per instance.");
+        }
+    }
+
+    if (selected_section == 7) {
+        ImGui::Checkbox("Switch to Left-Sided LHJ", &wallesslhjswitch);
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("This macro allows you to perform a lag high jump without using a wall. Offset your center of mass sideways or downward, keep at least one full foot on the platform, then trigger the macro.");
+    }
+
+    if (selected_section == 8) {
+        ImGui::TextWrapped("Item Clip Slot:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(30.0f);
+        if (ImGui::InputText("##ItemClipSlot", ItemClipSlot, sizeof(ItemClipSlot), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            try { clip_slot = std::stoi(ItemClipSlot); } catch (...) {}
+        }
+        ImGui::TextWrapped("Item Clip Delay in Milliseconds (Default 34ms):");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::InputText("##ItemClipDelay", ItemClipDelay, sizeof(ItemClipDelay), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            try { clip_delay = std::stoi(ItemClipDelay); } catch (...) {}
+        }
+        ImGui::Checkbox("Switch from Toggle Key to Hold Key", &isitemclipswitch);
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("This macro allows you to clip through thin walls using item equip timing.");
+        RenderCenteredMacroTutorialImage(MacroTutorialImage::GearClip, 248.0f, 140.0f);
+        ImGui::TextWrapped("To use this macro, shiftlock near the wall, jump, hold W, and let the macro equip and unequip the selected item using your delay. This can be RNG; lower FPS may help.");
+        ImGui::TextWrapped("If 'Disable outside of Target Application' is enabled, item clip only runs while tabbed into the target application.");
+    }
+
+    if (selected_section == 9) {
+        ImGui::Separator();
+        ImGui::Checkbox("Disable S being pressed (Slightly weaker laugh clips, but interferes with movement less)", &laughmoveswitch);
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("This macro allows you to clip through walls of 1+ studs of thickness.");
+        ImGui::TextWrapped("MUST BE ABOVE 60 FPS AND IN R6.");
+        ImGui::TextWrapped("Set yourself and the camera up like this:");
+        RenderCenteredMacroTutorialImage(MacroTutorialImage::LaughClip, 248.0f, 140.0f);
+        ImGui::TextWrapped("After this, trigger the macro. It will type /e laugh using the settings from Item Unequip COM Offset. Higher FPS is better.");
+    }
+
+    if (selected_section == 10) {
+        float currentWallWalkValue = static_cast<float>(std::atof(RobloxSensValue));
+        if (currentWallWalkValue != 0.0f && currentWallWalkValue != PreviousWallWalkValue) {
+            wallwalk_strengthx = static_cast<int>(std::round(((camfixtoggle ? 500.0f : 360.0f) / currentWallWalkValue) * 0.13f));
+            wallwalk_strengthy = -wallwalk_strengthx;
+        }
+        PreviousWallWalkValue = currentWallWalkValue;
+        std::snprintf(RobloxWallWalkValueChar, sizeof(RobloxWallWalkValueChar), "%d", wallwalk_strengthx);
+        ImGui::TextWrapped("Wall-Walk Pixel Value BASED ON SENSITIVITY (meant to be low):");
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::SameLine();
+        ImGui::InputText("##PixelValue", RobloxWallWalkValueChar, sizeof(RobloxWallWalkValueChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank);
+        ImGui::Checkbox("Switch to Left-Flick Wallwalk", &wallwalktoggleside);
+        ImGui::SetNextItemWidth(100.0f);
+        ImGui::InputText("Delay Between Flicks (Don't change from 72720 unless neccessary):", RobloxWallWalkValueDelayChar, sizeof(RobloxWallWalkValueDelayChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank);
+        try { RobloxWallWalkValueDelay = static_cast<int>(std::atof(RobloxWallWalkValueDelayChar)); } catch (...) {}
+        try {
+            wallwalk_strengthx = std::stoi(RobloxWallWalkValueChar);
+            wallwalk_strengthy = -std::stoi(RobloxWallWalkValueChar);
+        } catch (...) {}
+        ImGui::Checkbox("Switch from Toggle Key to Hold Key", &iswallwalkswitch);
+        ImGui::Separator();
+        ImGui::TextWrapped("IMPORTANT: For best results, input your Roblox in-game sensitivity.");
+        ImGui::TextWrapped("Higher FPS makes this more stable, but 60 FPS is enough for infinite distance.");
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("This macro allows you to walk inside wall seams when there are two parts stacked above each other.");
+        RenderCenteredMacroTutorialImage(MacroTutorialImage::Wallwalk, 248.0f, 140.0f);
+        ImGui::TextWrapped("Walk up to the seam at a slight angle, then trigger the macro while holding W and D or W and A depending on the selected flick side.");
+    }
+
+    if (selected_section == 11) {
+        if (spamkey_instances.empty()) {
+            ImGui::TextWrapped("No spamkey instances.");
+        } else {
+            SpamkeyInstance& inst = spamkey_instances[selected_spamkey_instance];
+            std::string sid = "_sk" + std::to_string(selected_spamkey_instance);
+            if (spamkey_instances.size() > 1) {
+                ImGui::TextWrapped("%s of %d", BuildMultiInstanceName(11, selected_spamkey_instance + 1).c_str(), static_cast<int>(spamkey_instances.size()));
+                ImGui::SameLine();
+            }
+            if (ImGui::Button(("+ Add New##AddSK" + sid).c_str())) spamkey_instances.emplace_back();
+            RenderRemoveInstanceButton("RemSK" + sid, 11, spamkey_instances.size(), selected_spamkey_instance, request_remove_spamkey_instance_index);
+            ImGui::Separator();
+            ImGui::TextWrapped("Key to Press:");
+            ImGui::SameLine();
+            DrawKeyBindControl(("SpamKey" + sid).c_str(), inst.vk_spamkey, selected_section, 170.0f, 130.0f, true);
+            ImGui::TextWrapped("Spam Delay (Milliseconds):");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120.0f);
+            if (ImGui::InputText(("##SpamDelay" + sid).c_str(), inst.SpamDelay, sizeof(SpamkeyInstance::SpamDelay), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                try {
+                    inst.spam_delay = std::stof(inst.SpamDelay);
+                    inst.real_delay = static_cast<int>((inst.spam_delay + 0.5f) / 2);
+                } catch (...) {}
+            }
+            ImGui::TextWrapped("I do not take any responsibility if you set the delay to 0ms");
+            ImGui::Checkbox(("Switch from Toggle Key to Hold Key##" + sid).c_str(), &inst.isspamswitch);
+            ImGui::Separator();
+            ImGui::TextWrapped("Explanation:");
+            ImGui::NewLine();
+            ImGui::TextWrapped("This macro allows you to spam a key very fast while the macro is active. You can use it for gear clipping, autoclicking, or general key-spam.");
+            RenderCenteredMacroTutorialImage(MacroTutorialImage::GearClip, 248.0f, 140.0f);
+            ImGui::TextWrapped("For gear clipping, set up near the wall like above, trigger the macro, and hold W. This can be RNG, but lower FPS often helps.");
+        }
+    }
+
+    if (selected_section == 12) {
+        ImGui::Checkbox("Switch Ledge Bounce to Left-Sided", &bouncesidetoggle);
+        ImGui::Checkbox("Stay Horizontal After Bounce", &bouncerealignsideways);
+        ImGui::Checkbox("Automatically Hold Movement Keys", &bounceautohold);
+        ImGui::Separator();
+        ImGui::TextWrapped("IMPORTANT:");
+        ImGui::TextWrapped("PLEASE SET YOUR ROBLOX SENS AND CAM-FIX CORRECTLY SO IT CAN ACTUALLY DO THE PROPER TURNS! It works best at high FPS (120+).");
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("This macro allows you to drop from a ledge and bounce back with timed camera movement. Walk up to a ledge with your camera sideways and about half of your left foot on the platform, then trigger the macro.");
+    }
+
+    if (selected_section == 13) {
+        ImGui::TextWrapped("Bunnyhop Delay in Milliseconds (Default 10ms):");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::InputText("##BunnyhopDelay", BunnyHopDelayChar, sizeof(BunnyHopDelayChar), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            try { BunnyHopDelay = static_cast<int>(std::atof(BunnyHopDelayChar)); } catch (...) {}
+        }
+        ImGui::Checkbox("Enable Intelligent Auto-Toggle", &bunnyhopsmart);
+        ImGui::Separator();
+        ImGui::TextWrapped("If Intelligent Auto-Toggle is on, pressing your chat key will temporarily disable bhop until you press left click or enter to leave the chat.");
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("This macro allows you to bunnyhop automatically while a movement key is held. It is a more practical spam-key setup for bhop, with smart toggling to avoid chat/input conflicts.");
+        ImGui::TextWrapped("This will only be restricted to the target application when 'Disable outside of Target Application' is enabled.");
+    }
+
+    if (selected_section == 14) {
+        ImGui::Checkbox("Attempt to HHJ for potentially slightly more height (EXPERIMENTAL, NOT RECOMMENDED)", &floorbouncehhj);
+        if (ImGui::CollapsingHeader("Advanced Floor Bounce HHJ Options", showadvancedhhjbounce ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+            showadvancedhhjbounce = true;
+            auto drawDelay = [](const char* id, const char* label, int& value, char* buffer, size_t bufferSize, int defaultValue) {
+                ImGui::Indent();
+                if (ImGui::Button(id, ImVec2(25, 0))) {
+                    value = defaultValue;
+                    std::snprintf(buffer, bufferSize, "%d", value);
+                }
+                ImGui::SameLine();
+                ImGui::TextWrapped("%s", label);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(50);
+                if (ImGui::InputText((std::string("##") + id).c_str(), buffer, bufferSize, ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+                    try { value = std::stoi(buffer); } catch (...) {}
+                }
+                ImGui::Unindent();
+            };
+            ImGui::Spacing();
+            drawDelay("R##FloorBounceDelay1", "Delay (Milliseconds) after unfreezing and before shiftlocking", FloorBounceDelay1, FloorBounceDelay1Char, sizeof(FloorBounceDelay1Char), 5);
+            drawDelay("R##FloorBounceDelay2", "Delay (Milliseconds) before enabling helicoptering", FloorBounceDelay2, FloorBounceDelay2Char, sizeof(FloorBounceDelay2Char), 8);
+            drawDelay("R##FloorBounceDelay3", "Time (Milliseconds) spent helicoptering", FloorBounceDelay3, FloorBounceDelay3Char, sizeof(FloorBounceDelay3Char), 100);
+            ImGui::Spacing();
+        }
+        ImGui::TextWrapped("IMPORTANT:");
+        ImGui::TextWrapped("This module only works at default Roblox gravity. Only works in R6 for now. FPS must be set to 160 or more to function properly. Higher is better.");
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::NewLine();
+        ImGui::TextWrapped("This macro allows you to jump much higher from flat ground. Have 160+ FPS, R6, and default Roblox gravity; higher FPS is better.");
+        ImGui::TextWrapped("After this, trigger the macro on flat ground. Results can vary, and the HHJ option may add a little more height but is experimental.");
+    }
+
+    if (selected_section == 15) {
+#if defined(__APPLE__)
+        prevent_disconnect = false;
+        lagswitchlag = false;
+#endif
+
+#if defined(__APPLE__)
+        auto backend = smu::platform::GetNetworkLagBackend();
+        ImGui::TextWrapped("Network Lag Switch");
+        ImGui::Separator();
+        ImGui::TextColored(GetCurrentTheme().warning_color, "Unavailable on macOS");
+        ImGui::TextWrapped(
+            "A safe macOS lag switch requires a Developer ID-signed, Apple-entitled "
+            "Network Extension. This build does not install or pretend to provide one.");
+        if (backend) {
+            ImGui::Spacing();
+            ImGui::TextWrapped("%s", backend->unsupportedReason().c_str());
+        }
+#else
+        auto backend = smu::platform::GetNetworkLagBackend();
+
+        ImGui::Checkbox("Switch from Hold Key to Toggle Key", &islagswitchswitch);
+        ImGui::Separator();
+        ImGui::TextWrapped("Explanation:");
+        ImGui::TextWrapped("This macro allows you to temporarily block or delay Roblox network traffic. Use the direction checkboxes below to choose whether other players stop seeing you, you stop seeing them, or both.");
+        ImGui::Separator();
+#if defined(_WIN32)
+        ImVec2 tooltipCursorPos = ImGui::GetCursorScreenPos();
+        ImGui::Checkbox("Prevent Roblox Disconnection (", &prevent_disconnect);
+        ImGui::SameLine(0, 0);
+        ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().accent_primary);
+        ImGui::Text("?");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0, 0);
+        ImGui::Text(")");
+        ImGui::SetCursorScreenPos(tooltipCursorPos);
+        ImGui::InvisibleButton("##tooltip", ImGui::CalcTextSize("Prevent Roblox Disconnection (?)      "));
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Prevents Timeout past the usual 10s threshold.\nExperimental, may break or kick. This is actively being worked on.");
+        }
+        ImGui::SetCursorScreenPos(ImVec2(tooltipCursorPos.x, tooltipCursorPos.y + 6));
+        ImGui::NewLine();
+#endif
+
+        bool filterChanged = false;
+        if (ImGui::Checkbox("Only Lag Switch Roblox", &lagswitchtargetroblox)) filterChanged = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Filters only Roblox traffic.");
+        if (ImGui::Checkbox("Also Block TCP (Websites)", &lagswitchusetcp)) filterChanged = true;
+        ImGui::Separator();
+        ImGui::Checkbox("Auto-Unlag (Anti-Kick) (Non-Roblox Games Only)", &lagswitch_autounblock);
+        if (!lagswitch_autounblock) ImGui::BeginDisabled();
+        ImGui::TextWrapped("Automatically stops lagging after this amount of seconds");
+        ImGui::SetNextItemWidth(60.0f);
+        ImGui::InputFloat("##LagFloat", &lagswitch_max_duration, 0.0f, 0.0f, "%.2f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(300.0f);
+        ImGui::SliderFloat("##LagSlider", &lagswitch_max_duration, 0.0f, 15.0f, "%.2f Seconds");
+        char lagUnblockBuffer[16];
+        std::snprintf(lagUnblockBuffer, sizeof(lagUnblockBuffer), "%d", lagswitch_unblock_ms);
+        ImGui::SetNextItemWidth(50.0f);
+        if (ImGui::InputText("Modify 50ms Default Unlag Time (MS)", lagUnblockBuffer, sizeof(lagUnblockBuffer), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank)) {
+            lagswitch_unblock_ms = std::atoi(lagUnblockBuffer);
+        }
+        if (!lagswitch_autounblock) ImGui::EndDisabled();
+
+        ImGui::Separator();
+        if (ImGui::Checkbox("Block Outbound (Upload/Send) (Players won't be able to see you move)", &lagswitchoutbound)) filterChanged = true;
+        if (ImGui::Checkbox("Block Inbound (Download/Recv) (You won't be able to see other players move)", &lagswitchinbound)) filterChanged = true;
+        if (!lagswitchoutbound && !lagswitchinbound) {
+            ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().warning_color);
+            ImGui::TextWrapped("WARNING: Both Inbound and Outbound are unchecked.\nThe Lag Switch will not block any packets.");
+            ImGui::PopStyleColor();
+        }
+
+#if defined(_WIN32) || defined(__linux__)
+        ImGui::Separator();
+        if (ImGui::Checkbox("Fake Lag (Simulate High Ping)", &lagswitchlag)) filterChanged = true;
+        if (!lagswitchlag) ImGui::BeginDisabled();
+        ImGui::Indent();
+        ImGui::Text("Delay Amount (Milliseconds):");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(150.0f);
+        ImGui::InputInt("##LagDelayInput", &lagswitchlagdelay, 10, 100);
+        if (ImGui::Checkbox("Lag Inbound (Recv)##FakeLag", &lagswitchlaginbound)) filterChanged = true;
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Lag Outbound (Send)##FakeLag", &lagswitchlagoutbound)) filterChanged = true;
+        if (lagswitchlag && !lagswitchlaginbound && !lagswitchlagoutbound) {
+            ImGui::TextColored(GetCurrentTheme().warning_color, "Select at least one direction to lag!");
+        }
+        if (lagswitchlag && ((lagswitchoutbound && lagswitchlagoutbound) || (lagswitchinbound && lagswitchlaginbound))) {
+            ImGui::PushStyleColor(ImGuiCol_Text, GetCurrentTheme().warning_color);
+            ImGui::TextWrapped("WARNING: Both Blocking and Lagging are enabled for Inbound/Outbound packets.\nBlocking takes priority over lagging.");
+            ImGui::PopStyleColor();
+        }
+        ImGui::Unindent();
+        if (!lagswitchlag) ImGui::EndDisabled();
+        ImGui::Separator();
+#endif
+
+        if (filterChanged && bWinDivertEnabled) RestartLagSwitchCapture();
+        else SyncLagSwitchBackendConfig();
+
+#if defined(_WIN32)
+        ImGui::Checkbox("Show Lagswitch Status Overlay", &show_lag_overlay);
+        if (!show_lag_overlay) ImGui::BeginDisabled();
+        ImGui::Indent();
+        ImGui::Checkbox("Hide When Not Actively Lagswitching", &overlay_hide_inactive);
+        int screenW = static_cast<int>(ImGui::GetIO().DisplaySize.x);
+        int screenH = static_cast<int>(ImGui::GetIO().DisplaySize.y);
+        // Use the full Windows virtual desktop (all monitors) instead of the SDL window size.
+        const int virtualMinX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const int virtualMinY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const int virtualW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        const int virtualH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        screenW = std::max(1, virtualW);
+        screenH = std::max(1, virtualH);
+        if (overlay_x == -1) overlay_x = virtualMinX + static_cast<int>(virtualW * 0.8f);
+        // Allow negative coordinates for multi-monitor layouts where the virtual origin is not (0,0).
+        const int sliderMinX = virtualMinX;
+        const int sliderMaxX = virtualMinX + virtualW;
+        const int sliderMinY = virtualMinY;
+        const int sliderMaxY = virtualMinY + virtualH;
+        ImGui::PushItemWidth(500);
+        ImGui::SliderInt("Overlay X", &overlay_x, sliderMinX, sliderMaxX);
+        ImGui::SliderInt("Overlay Y", &overlay_y, sliderMinY, sliderMaxY);
+        ImGui::SliderInt("Text Size", &overlay_size, 10, 100);
+        ImGui::Checkbox("Add Background", &overlay_use_bg);
+        if (!overlay_use_bg) ImGui::BeginDisabled();
+        float colors[3] = {overlay_bg_r, overlay_bg_g, overlay_bg_b};
+        if (ImGui::ColorEdit3("Background Color", colors)) {
+            overlay_bg_r = colors[0];
+            overlay_bg_g = colors[1];
+            overlay_bg_b = colors[2];
+        }
+        ImGui::PopItemWidth();
+        if (!overlay_use_bg) ImGui::EndDisabled();
+        ImGui::Unindent();
+        if (!show_lag_overlay) ImGui::EndDisabled();
+#elif defined(__linux__)
+        ImGui::BeginDisabled();
+        ImGui::Checkbox("Show Lagswitch Status Overlay (Windows Only)", &show_lag_overlay);
+        ImGui::EndDisabled();
+#endif
+
+        ImGui::NewLine();
+        ImGui::Separator();
+#if defined(__linux__)
+        bool linuxHelperReady = backend && backend->isAvailable();
+#endif
+        const char* lagSwitchButtonLabel =
+#if defined(__linux__)
+            bWinDivertEnabled ? "Disable Lagswitch" : (linuxHelperReady ? "Enable Lagswitch" : "Enable Lagswitch Helper");
+#else
+            bWinDivertEnabled ? "Disable WinDivert" : "Enable WinDivert";
+#endif
+        if (ImGui::Button(lagSwitchButtonLabel)) {
+            if (!bWinDivertEnabled) {
+                std::string backendError;
+                if (!InitializeLagSwitchBackend(&backendError)) {
+                    if (!backendError.empty()) {
+                        LogCritical(backendError);
+                    }
+#if defined(_WIN32)
+                    if (!smu::platform::windows::IsRunAsAdmin()) {
+                        if (DontShowAdminWarning) {
+                            smu::app::SaveSharedProfilesNow();
+                            if (smu::platform::windows::RestartAsAdmin()) {
+                                done.store(true, std::memory_order_release);
+                                running.store(false, std::memory_order_release);
+                                auto& appState = smu::core::GetAppState();
+                                appState.done.store(true, std::memory_order_release);
+                                appState.running.store(false, std::memory_order_release);
+                            }
+                        } else {
+                            bShowAdminPopup = true;
+                        }
+                    }
+#endif
+#if defined(__linux__)
+                    if (backendError.empty()) {
+                        if (DontShowAdminWarning) {
+                            smu::app::SaveSharedProfilesNow();
+                            std::string helperError;
+                            if (!smu::app::StartLinuxNetworkHelperWithGraphicalPkexec(&helperError)) {
+                                if (!helperError.empty()) {
+                                    LogWarning(helperError);
+                                }
+                            } else {
+                                std::string retryError;
+                                if (!InitializeLagSwitchBackend(&retryError) && !retryError.empty()) {
+                                    LogWarning(retryError);
+                                }
+                            }
+                        } else {
+                            bShowAdminPopup = true;
+                        }
+                    }
+#endif
+                }
+            } else {
+                ShutdownLagSwitchBackend();
+            }
+        }
+        ImGui::SameLine();
+#if defined(__linux__)
+        linuxHelperReady = backend && backend->isAvailable();
+#endif
+        const char* runningLabel =
+#if defined(__linux__)
+            linuxHelperReady ? "Helper Ready" : "Helper Not Running";
+#else
+            bWinDivertEnabled ? "Driver Running" : "Driver Not Running";
+#endif
+        ImGui::TextColored(
+#if defined(__linux__)
+            linuxHelperReady ? GetCurrentTheme().success_color : GetCurrentTheme().error_color,
+#else
+            bWinDivertEnabled ? GetCurrentTheme().success_color : GetCurrentTheme().error_color,
+#endif
+            "%s", runningLabel);
+        if (bWinDivertEnabled) {
+            ImGui::SameLine();
+            ImGui::Text(" |  Status: ");
+            ImGui::SameLine();
+            ImGui::TextColored(g_windivert_blocking ? GetCurrentTheme().error_color : GetCurrentTheme().success_color,
+                g_windivert_blocking ? "LAGGING" : "Clear");
+        }
+
+#endif
+    }
+}
+
+} // namespace
+
+void ResetFloatingUiWindowState()
+{
+    ResetFloatingUiWindowStateInternal();
+}
+
+void RenderPlatformCriticalNotifications()
+{
+    static std::vector<smu::log::LogEntry> activeNotifications;
+    auto newNotifications = smu::log::DrainCriticalNotifications();
+    activeNotifications.insert(activeNotifications.end(), newNotifications.begin(), newNotifications.end());
+    if (activeNotifications.empty()) {
+        return;
+    }
+
+    ImGui::OpenPopup("Critical Platform Error");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Critical Platform Error", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("A required platform feature failed to initialize.");
+        ImGui::Separator();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 520.0f);
+        ImGui::TextUnformatted(activeNotifications.front().message.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::Separator();
+        const bool hasMore = activeNotifications.size() > 1;
+        if (ImGui::Button(hasMore ? "Next" : "Dismiss", ImVec2(120, 0))) {
+            activeNotifications.erase(activeNotifications.begin());
+            if (activeNotifications.empty()) {
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void RenderPlatformWarningNotifications()
+{
+    static std::vector<smu::log::LogEntry> activeWarnings;
+    auto newWarnings = smu::log::DrainWarningNotifications();
+    activeWarnings.insert(activeWarnings.end(), newWarnings.begin(), newWarnings.end());
+    if (activeWarnings.empty()) {
+        return;
+    }
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImVec2 pos(viewport->WorkPos.x + viewport->WorkSize.x - 24.0f, viewport->WorkPos.y + 24.0f);
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.96f);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNav;
+
+    if (ImGui::Begin("Platform Warnings", nullptr, flags)) {
+        ImGui::TextUnformatted("Warning");
+        ImGui::Separator();
+        RenderSelectableToastMessage(activeWarnings.front().message);
+        if (ImGui::Button("Dismiss", ImVec2(100.0f, 0.0f))) {
+            activeWarnings.erase(activeWarnings.begin());
+        }
+        if (activeWarnings.size() > 1) {
+            ImGui::SameLine();
+            ImGui::Text("%zu more", activeWarnings.size() - 1);
+        }
+    }
+    ImGui::End();
+}
+
+void RenderForegroundDependentCheckbox(AppContext& context, const char* label, const char* id, bool* value)
+{
+    if (!value) {
+        return;
+    }
+
+    const bool fallbackActive = IsForegroundDetectionFallbackActive(context);
+    bool forcedValue = false;
+    bool* checkboxValue = fallbackActive ? &forcedValue : value;
+    ImGui::BeginDisabled(fallbackActive);
+    ImGui::TextWrapped("%s", label);
+    ImGui::SameLine();
+    ImGui::Checkbox(id, checkboxValue);
+    ImGui::EndDisabled();
+    if (fallbackActive && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("%s", kForegroundFallbackTooltip);
+    }
+}
+
+bool QueueDroppedScriptImport(const std::filesystem::path& path)
+{
+    if (!IsValidDroppedScriptFile(path)) {
+        LogWarning("Rejected dropped script file: " + path.string());
+        return false;
+    }
+
+    QueueScriptImportTrustModal(path);
+    return true;
+}
+
+void RenderAppUi(AppContext& context)
+{
+    RefreshPlatformCapabilitiesForUi(context);
+
+    MaybeWarnForegroundDetectionFallback(context);
+    if (sections.empty()) {
+        InitializeSections();
+    }
+    if (presskey_instances.empty()) presskey_instances.emplace_back();
+    if (wallhop_instances.empty()) wallhop_instances.emplace_back();
+    if (spamkey_instances.empty()) spamkey_instances.emplace_back();
+
+    ApplySharedTheme();
+
+    ImGuiIO& io = ImGui::GetIO();
+    if (g_instance_remove_confirm_state.stage != 0) {
+        g_instance_remove_confirm_state.timer -= io.DeltaTime;
+        bool shouldReset = g_instance_remove_confirm_state.timer <= 0.0f;
+        const int currentTarget = GetCurrentRemovalTargetForSection(g_instance_remove_confirm_state.section_index);
+        if (currentTarget < 0 || currentTarget != g_instance_remove_confirm_state.target_instance_index) {
+            shouldReset = true;
+        }
+        if (selected_section != g_instance_remove_confirm_state.section_index) {
+            shouldReset = true;
+        }
+        if (shouldReset) {
+            ResetInstanceRemoveConfirmState();
+        }
+    }
+
+    ImVec2 displaySize = io.DisplaySize;
+    ImGui::SetNextWindowSize(displaySize, ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+
+    ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+    ImGui::Begin("Main SMU Window", nullptr, windowFlags);
+    ImGui::PopStyleVar();
+
+#if defined(_WIN32)
+    smu::platform::windows::UpdateLagswitchOverlay();
+#endif
+
+#if defined(__linux__)
+    if (context.refreshLinuxWaylandScreenCapture) {
+        context.refreshLinuxWaylandScreenCapture();
+    }
+#endif
+
+    RenderPlatformCriticalNotifications();
+    RenderPlatformWarningNotifications();
+    RenderMacOSPermissionSetup(context);
+    RenderLinuxInputSetup(context);
+    RenderWaylandScreenCapturePrompt(context);
+    RenderWaylandRemoteDesktopPrompt(context);
+    RenderUpdateConfirmationModal(context);
+    RenderAdministratorRequiredPopup();
+    RenderScriptFileDialogFallback();
+    RenderImportTrustModal();
+
+    float settingsPanelHeight = ImGui::GetTextLineHeightWithSpacing() * 4.0f + ImGui::GetStyle().WindowPadding.y * 3.0f + 12.0f;
+    ImGui::BeginChild("GlobalSettings", ImVec2(displaySize.x - 16, settingsPanelHeight), true);
+    RenderGlobalSettings(context, displaySize);
+    ImGui::EndChild();
+
+    float leftPanelWidth = ImGui::GetWindowSize().x * 0.3f - 23;
+    ImGui::BeginChild("LeftScrollSection", ImVec2(leftPanelWidth, ImGui::GetWindowSize().y - settingsPanelHeight - 20), true);
+    RenderSectionSidebar(leftPanelWidth);
+    RenderImportedScriptsSidebar(leftPanelWidth);
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+    ImVec2 rightSectionSize(displaySize.x - 23 - leftPanelWidth, displaySize.y - settingsPanelHeight - 20 - 30);
+    ImGui::BeginChild("RightSection", rightSectionSize, true);
+    RenderSelectedSection(context);
+    ImGui::EndChild();
+
+    ImVec2 childPos = ImGui::GetItemRectMin();
+    ImVec2 childSize = ImGui::GetItemRectSize();
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImU32 bgColor = ImGui::GetColorU32(ImGuiCol_ChildBg);
+    ImU32 borderColor = ImGui::GetColorU32(ImGuiCol_Border);
+    float rounding = ImGui::GetStyle().ChildRounding;
+
+    ImVec2 windowSize = ImGui::GetWindowSize();
+    ImGui::SetCursorPosY(windowSize.y - 30 - ImGui::GetStyle().WindowPadding.y);
+    ImGui::SetCursorPosX(childPos.x);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+
+    if (ImGui::BeginChild("BottomControls", ImVec2(childSize.x - 1, 30), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        ImGui::SameLine(childSize.x - 616);
+        ImGui::AlignTextToFramePadding();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3);
+        ImGui::Text("Always On-Top");
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3);
+        if (ImGui::Checkbox("##OnTopToggle", &ontoptoggle)) {
+            if (context.setAlwaysOnTop && !context.setAlwaysOnTop(ontoptoggle)) {
+                LogWarning("Always-on-top could not be applied to the SDL window on this platform.");
+            }
+        }
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3);
+        ImGui::Text("Opacity");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(100.0f);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3);
+        if (ImGui::SliderFloat("##OpacitySlider", &windowOpacityPercent, 20.0f, 100.0f, "%.0f%%")) {
+            if (context.setWindowOpacityPercent && !context.setWindowOpacityPercent(windowOpacityPercent)) {
+                LogWarning("Window opacity could not be applied to the SDL window on this platform.");
+            }
+        }
+
+        drawList->AddRectFilled(ImVec2(childPos.x, childPos.y + childSize.y - rounding), ImVec2(childPos.x + rounding, childPos.y + childSize.y), bgColor);
+        drawList->AddRectFilled(ImVec2(childPos.x + childSize.x - rounding, childPos.y + childSize.y - rounding), ImVec2(childPos.x + childSize.x, childPos.y + childSize.y), bgColor);
+        drawList->AddLine(ImVec2(childPos.x, childPos.y + childSize.y - rounding - 1), ImVec2(childPos.x, childPos.y + childSize.y + 29), borderColor);
+        drawList->AddLine(ImVec2(childPos.x + childSize.x - 1, childPos.y + childSize.y - rounding - 1), ImVec2(childPos.x + childSize.x - 1, childPos.y + childSize.y + 29), borderColor);
+        drawList->AddLine(ImVec2(childPos.x + 1, childPos.y + childSize.y - 1), ImVec2(childPos.x + childSize.x - 1, childPos.y + childSize.y - 1), bgColor, 1.0f);
+        drawList->AddLine(ImVec2(childPos.x, childPos.y + childSize.y + 29), ImVec2(childPos.x + childSize.x, childPos.y + childSize.y + 29), borderColor, 1.0f);
+
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3);
+        RenderSharedProfileManager();
+    }
+
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+} // namespace smu::app
+
+namespace smu::app {
+
+void DrawKeyBindControlShared(const char* id,
+    unsigned int& key,
+    int currentSection,
+    float humanWidth,
+    float hexWidth,
+    bool wrapKeyBindingLabel)
+{
+    DrawKeyBindControl(id, key, currentSection, humanWidth, hexWidth, wrapKeyBindingLabel);
+}
+
+} // namespace smu::app

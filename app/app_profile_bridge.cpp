@@ -1,0 +1,100 @@
+#include "app_profile_bridge.h"
+
+#include "../core/legacy_globals.h"
+#include "profile_manager.h"
+#include "../core/app_state.h"
+#include "../platform/logging.h"
+
+namespace smu::app {
+
+namespace {
+
+constexpr const char kSettingsLoadFailedWarningId[] = "settings_load_failed";
+
+} // namespace
+
+void InitializeSharedProfiles()
+{
+    std::lock_guard<std::recursive_mutex> persistenceLock(GetProfilePersistenceMutex());
+    using namespace Globals;
+    auto& state = smu::core::GetAppState();
+
+    if (presskey_instances.empty()) {
+        presskey_instances.emplace_back();
+    }
+    if (wallhop_instances.empty()) {
+        wallhop_instances.emplace_back();
+    }
+    if (spamkey_instances.empty()) {
+        spamkey_instances.emplace_back();
+    }
+
+    // Establish runtime values from the compile-time UI defaults before the
+    // first profile snapshot is captured. This also covers a missing or
+    // unreadable settings file.
+    SyncRuntimeSettingsFromBuffers();
+
+    G_SETTINGS_FILEPATH = ResolveSettingsFilePath();
+    LogInfo("Chosen settings path: " + G_SETTINGS_FILEPATH);
+    // Capture defaults without touching the user's file. Format detection and
+    // recovery must happen before any startup write.
+    CaptureDefaultProfileSnapshot();
+    const bool loaded = TryLoadLastActiveProfile(G_SETTINGS_FILEPATH);
+    if (loaded) {
+        SaveDefaultProfile(G_SETTINGS_FILEPATH);
+    } else if (G_CURRENTLY_LOADED_PROFILE_NAME.empty()) {
+        G_CURRENTLY_LOADED_PROFILE_NAME = "Profile 1";
+        LogWarning("Continuing with in-memory default settings because the settings file could not be loaded.",
+            kSettingsLoadFailedWarningId, true);
+    }
+
+    state.screenWidth = screen_width;
+    state.screenHeight = screen_height;
+    state.rawWindowWidth = raw_window_width;
+    state.rawWindowHeight = raw_window_height;
+    state.windowPosX = WindowPosX;
+    state.windowPosY = WindowPosY;
+    state.windowOpacityPercent = windowOpacityPercent;
+    state.alwaysOnTop = ontoptoggle;
+}
+
+bool SaveSharedProfilesNow()
+{
+    std::lock_guard<std::recursive_mutex> persistenceLock(GetProfilePersistenceMutex());
+    using namespace Globals;
+    auto& state = smu::core::GetAppState();
+
+    if (G_SETTINGS_FILEPATH.empty()) {
+        return false;
+    }
+
+    screen_width = state.screenWidth;
+    screen_height = state.screenHeight;
+    raw_window_width = state.rawWindowWidth;
+    raw_window_height = state.rawWindowHeight;
+    WindowPosX = state.windowPosX;
+    WindowPosY = state.windowPosY;
+
+    if (G_CURRENTLY_LOADED_PROFILE_NAME == "(default)" &&
+        PromoteDefaultProfileIfDirty(G_SETTINGS_FILEPATH).empty()) {
+        return false;
+    }
+
+    if (!G_CURRENTLY_LOADED_PROFILE_NAME.empty() && G_CURRENTLY_LOADED_PROFILE_NAME != "(default)") {
+        return SaveSettings(G_SETTINGS_FILEPATH, G_CURRENTLY_LOADED_PROFILE_NAME);
+    }
+
+    return false;
+}
+
+void ShutdownSharedProfiles()
+{
+    SaveSharedProfilesNow();
+}
+
+void RenderSharedProfileManager()
+{
+    ProfileUI::DrawProfileManagerUI();
+}
+
+} // namespace smu::app
